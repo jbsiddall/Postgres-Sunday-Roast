@@ -63,17 +63,19 @@ settings=(
 
 fresh=
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  initdb_args=(-D "$PGDATA" -U "$POSTGRES_USER" --encoding=UTF8 --locale=en_US.UTF-8
+  # No --locale: initdb takes LANG, which the image sets to en_US.UTF-8.
+  initdb_args=(-D "$PGDATA" -U "$POSTGRES_USER" --encoding=UTF8
     --auth-local=trust --auth-host="$auth")
   if [ -n "${POSTGRES_PASSWORD:-}" ]; then
     pwfile="$(mktemp)"
     printf '%s' "$POSTGRES_PASSWORD" > "$pwfile"
     initdb_args+=(--pwfile="$pwfile")
-  elif [ "$auth" = trust ]; then
-    echo "Warning: POSTGRES_HOST_AUTH_METHOD=trust lets anyone who can reach port 5432 connect as any user, with no password" >&2
-  else
+  elif [ "$auth" != trust ]; then
     echo "POSTGRES_PASSWORD or POSTGRES_PASSWORD_FILE is required to initialise a new database, unless POSTGRES_HOST_AUTH_METHOD=trust" >&2
     exit 1
+  fi
+  if [ "$auth" = trust ]; then
+    echo "Warning: POSTGRES_HOST_AUTH_METHOD=trust lets anyone who can reach port 5432 connect as any user, with no password" >&2
   fi
   if [ -n "${POSTGRES_INITDB_WALDIR:-}" ]; then
     initdb_args+=(--waldir="$POSTGRES_INITDB_WALDIR")
@@ -129,7 +131,9 @@ if [ -n "$fresh" ]; then
   fi
   pg_ctl -D "$PGDATA" -w start -o "$(printf '%q ' "${settings[@]}" "$@" \
     -c listen_addresses= -c unix_socket_directories="$PGHOST" -p "$PGPORT")"
-  if [ "$POSTGRES_DB" != postgres ]; then
+  # initdb already made postgres, template0 and template1.
+  exists="$(psql -v ON_ERROR_STOP=1 -X -qtA -d postgres -v db="$POSTGRES_DB" <<< "select 1 from pg_database where datname = :'db'")"
+  if [ -z "$exists" ]; then
     psql -v ON_ERROR_STOP=1 -X -q -d postgres -v db="$POSTGRES_DB" <<< 'create database :"db"'
   fi
   psql=(psql -v ON_ERROR_STOP=1 -X -q -d "$POSTGRES_DB")

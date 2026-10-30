@@ -55,7 +55,11 @@ for ext in $exts; do
   fi
 done
 
-check plpython3u "$(psql -d smoke -c 'do $$ plpy.notice(1) $$ language plpython3u' 2>&1 | grep -c NOTICE)" 1
+if out="$(psql -d smoke -c 'do $ plpy.notice(1) $ language plpython3u' 2>&1)"; then
+  check plpython3u "$(grep -c NOTICE <<< "$out")" 1
+else
+  check plpython3u "$out" 'one NOTICE and success'
+fi
 check pljs "$(psql -d smoke -c 'create function js_double(n int) returns int language pljs as $$ return n * 2 $$' -c 'select js_double(21)')" 42
 check pg_duckdb "$(psql -d smoke -c 'select * from duckdb.query($$ select 40 + 2 as answer $$)')" 42
 check vector "$(psql -d smoke -c "select '[1,2,3]'::vector <-> '[1,2,4]'::vector")" 1

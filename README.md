@@ -63,6 +63,7 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 | `POSTGRES_DB` | `$POSTGRES_USER` | Database created on first start. |
 | `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--data-checksums`. |
 | `POSTGRES_INITDB_WALDIR` | inside `PGDATA` | Put the write-ahead log in another directory, e.g. a faster volume. |
+| `LANG` | `en_US.UTF-8` | Locale of a new cluster. `C.UTF-8` is the only other locale in the image. |
 | `POSTGRES_HOST_AUTH_METHOD` | `scram-sha-256` | Authentication for TCP connections. `trust` needs no password from anyone who can reach the port, so use it only for throwaway local databases. |
 | `PGDATA` | `/var/lib/postgresql/18/data` | Data directory. Mount a volume at `/var/lib/postgresql`. |
 | `POSTGRES_SSL_CERT_FILE`, `POSTGRES_SSL_KEY_FILE` | self-signed in `$PGDATA` | Use your own certificate, e.g. from a Kubernetes secret. |
