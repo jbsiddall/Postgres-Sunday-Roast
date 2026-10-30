@@ -55,7 +55,7 @@ for ext in $exts; do
   fi
 done
 
-if out="$(psql -d smoke -c 'do $ plpy.notice(1) $ language plpython3u' 2>&1)"; then
+if out="$(psql -d smoke -c 'do $$ plpy.notice(1) $$ language plpython3u' 2>&1)"; then
   check plpython3u "$(grep -c NOTICE <<< "$out")" 1
 else
   check plpython3u "$out" 'one NOTICE and success'
