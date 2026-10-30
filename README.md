@@ -58,10 +58,12 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `POSTGRES_PASSWORD` | required on first start | Password of `POSTGRES_USER`. |
+| `POSTGRES_PASSWORD` | required on first start | Password of `POSTGRES_USER`. Optional only with `POSTGRES_HOST_AUTH_METHOD=trust`. |
 | `POSTGRES_USER` | `postgres` | Superuser created on first start. |
 | `POSTGRES_DB` | `$POSTGRES_USER` | Database created on first start. |
 | `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--data-checksums`. |
+| `POSTGRES_INITDB_WALDIR` | inside `PGDATA` | Put the write-ahead log in another directory, e.g. a faster volume. |
+| `POSTGRES_HOST_AUTH_METHOD` | `scram-sha-256` | Authentication for TCP connections. `trust` needs no password from anyone who can reach the port, so use it only for throwaway local databases. |
 | `PGDATA` | `/var/lib/postgresql/18/data` | Data directory. Mount a volume at `/var/lib/postgresql`. |
 | `POSTGRES_SSL_CERT_FILE`, `POSTGRES_SSL_KEY_FILE` | self-signed in `$PGDATA` | Use your own certificate, e.g. from a Kubernetes secret. |
 | `POSTGRES_SSL_CN` | `postgres` | Common name of the generated certificate. |
@@ -96,7 +98,8 @@ clients and shuts down cleanly instead of waiting for idle connections until
 the server is killed.
 
 Authentication: local socket connections are trusted, and every TCP connection
-must use a password (SCRAM-SHA-256). SSL is always on; to force it for TCP,
+must use a password (SCRAM-SHA-256, unless `POSTGRES_HOST_AUTH_METHOD` says
+otherwise). SSL is always on; to force it for TCP,
 change `host` to `hostssl` in `pg_hba.conf`.
 
 User: the server runs as uid and gid 999. If a volume was created for a
