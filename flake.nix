@@ -67,7 +67,9 @@
         tag = pkgs.postgresql_18.version;
         contents = [ postgres entrypoint nss locales pkgs.bashInteractive pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.gzip pkgs.openssl pkgs.tzdata pkgs.cacert ];
         fakeRootCommands = ''
-          mkdir -p ./tmp ./run/postgresql ./var/lib/postgresql ./docker-entrypoint-initdb.d
+          mkdir -p ./tmp ./run/postgresql ./var/lib/postgresql ./docker-entrypoint-initdb.d ./usr/bin
+          # Init scripts often start with #!/usr/bin/env bash.
+          ln -s /bin/env ./usr/bin/env
           chmod 1777 ./tmp
           chown 999:999 ./run/postgresql ./var/lib/postgresql
           chmod 2775 ./run/postgresql
@@ -75,6 +77,9 @@
         config = {
           User = "999:999";
           Entrypoint = [ "/bin/docker-entrypoint" ];
+          # SIGTERM is a smart shutdown that waits for idle pooled connections
+          # until the runtime kills the server; SIGINT is a clean fast shutdown.
+          StopSignal = "SIGINT";
           ExposedPorts."5432/tcp" = { };
           Volumes."/var/lib/postgresql" = { };
           Labels = {

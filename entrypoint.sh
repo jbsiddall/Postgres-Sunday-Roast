@@ -5,11 +5,37 @@
 # postgres image. It then starts PostgreSQL with SSL on, generating a
 # self-signed certificate unless one is supplied. Extra arguments are passed to
 # postgres after the defaults below, so `-c work_mem=64MB` style flags win.
+# A command that is not postgres, such as `psql` or `bash`, runs as given.
+
+if [ "${1:-}" = postgres ]; then
+  shift
+fi
+case "${1:-}" in
+  --help | -\? | --version | -V) exec postgres "$@" ;;
+  "" | -*) ;;
+  *) exec "$@" ;;
+esac
 
 : "${PGDATA:?PGDATA must be set}"
-user="${POSTGRES_USER:-postgres}"
-db="${POSTGRES_DB:-$user}"
 initdb_dir=/docker-entrypoint-initdb.d
+
+# Read VAR from the file named by VAR_FILE, for Docker and Kubernetes secrets.
+file_env() {
+  local var="$1" file_var="$1_FILE"
+  if [ -n "${!var:-}" ] && [ -n "${!file_var:-}" ]; then
+    echo "Set $var or $file_var, not both" >&2
+    exit 1
+  fi
+  if [ -n "${!file_var:-}" ]; then
+    export "$var"="$(< "${!file_var}")"
+    unset "$file_var"
+  fi
+}
+for name in POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB POSTGRES_INITDB_ARGS; do
+  file_env "$name"
+done
+export POSTGRES_USER="${POSTGRES_USER:-postgres}"
+export POSTGRES_DB="${POSTGRES_DB:-$POSTGRES_USER}"
 
 umask 077
 mkdir -p "$PGDATA"
@@ -33,12 +59,12 @@ settings=(
 
 fresh=
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to initialise a new database}"
+  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD or POSTGRES_PASSWORD_FILE is required to initialise a new database}"
   pwfile="$(mktemp)"
   printf '%s' "$POSTGRES_PASSWORD" > "$pwfile"
   # Word splitting is intended: POSTGRES_INITDB_ARGS holds several flags.
   # shellcheck disable=SC2086
-  initdb -D "$PGDATA" -U "$user" --pwfile="$pwfile" --encoding=UTF8 --locale=en_US.UTF-8 \
+  initdb -D "$PGDATA" -U "$POSTGRES_USER" --pwfile="$pwfile" --encoding=UTF8 --locale=en_US.UTF-8 \
     --auth-local=trust --auth-host=scram-sha-256 ${POSTGRES_INITDB_ARGS:-}
   rm -f "$pwfile"
   echo 'host all all all scram-sha-256' >> "$PGDATA/pg_hba.conf"
@@ -52,23 +78,36 @@ if [ ! -s "$key" ]; then
 fi
 
 if [ -n "$fresh" ]; then
-  # Set up on the Unix socket only, so no client sees a half-made database.
-  pg_ctl -D "$PGDATA" -w -o "$(printf '%q ' "${settings[@]}") -c listen_addresses=''" start
-  psql=(psql -v ON_ERROR_STOP=1 -X -q -h /run/postgresql -U "$user")
-  if [ "$db" != postgres ]; then
-    "${psql[@]}" -d postgres -c "create database \"$db\""
+  # Set up with the caller's settings, but on a known Unix socket only, so no
+  # client sees a half-made database. Scripts inherit the PG* variables, so a
+  # plain `psql` in an executable script reaches POSTGRES_DB.
+  export PGHOST=/run/postgresql PGPORT="${PGPORT:-5432}" PGUSER="$POSTGRES_USER" PGDATABASE="$POSTGRES_DB"
+  pg_ctl -D "$PGDATA" -w start -o "$(printf '%q ' "${settings[@]}" "$@" \
+    -c listen_addresses= -c unix_socket_directories="$PGHOST" -p "$PGPORT")"
+  if [ "$POSTGRES_DB" != postgres ]; then
+    psql -v ON_ERROR_STOP=1 -X -q -d postgres -v db="$POSTGRES_DB" <<< 'create database :"db"'
   fi
+  psql=(psql -v ON_ERROR_STOP=1 -X -q -d "$POSTGRES_DB")
   for f in "$initdb_dir"/*; do
     case "$f" in
       "$initdb_dir/*") ;;
-      *.sh) echo "Running $f"; # shellcheck disable=SC1090
-        . "$f" ;;
-      *.sql) echo "Running $f"; "${psql[@]}" -d "$db" -f "$f" ;;
-      *.sql.gz) echo "Running $f"; gzip -dc "$f" | "${psql[@]}" -d "$db" ;;
+      *.sh)
+        echo "Running $f"
+        # Like the official image: run executable scripts, source the rest.
+        if [ -x "$f" ]; then
+          "$f"
+        else
+          # shellcheck disable=SC1090
+          . "$f"
+        fi
+        ;;
+      *.sql) echo "Running $f"; "${psql[@]}" -f "$f" ;;
+      *.sql.gz) echo "Running $f"; gzip -dc "$f" | "${psql[@]}" ;;
       *) echo "Ignoring $f" ;;
     esac
   done
   pg_ctl -D "$PGDATA" -m fast -w stop
+  unset PGHOST PGUSER PGDATABASE
 fi
 
 exec postgres -D "$PGDATA" "${settings[@]}" -c listen_addresses='*' "$@"

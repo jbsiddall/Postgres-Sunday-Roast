@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke-test a running container of this image: SSL is on, the preload set is
-# loaded, the cron scheduler runs, init scripts ran, and every bundled
+# loaded, the cron scheduler runs jobs, init scripts ran in order, and every bundled
 # extension can be created. Start the container with POSTGRES_DB=app and
 # tests/initdb mounted at /docker-entrypoint-initdb.d.
 #   tests/smoke.sh <container> [docker|podman]
@@ -26,13 +26,27 @@ check preload "$(psql -c 'show shared_preload_libraries')" pg_stat_statements,pg
 check collate "$(psql -c "select datcollate from pg_database where datname = 'postgres'")" en_US.UTF-8
 check initdb-sql "$(psql -d app -c 'select count(*) from items')" 2
 check initdb-sh "$(psql -d app -c "select has_table_privilege('reader', 'items', 'select')")" t
-psql -c 'create extension if not exists pg_cron'
-check cron "$(psql -c "select cron.schedule('smoke', '* * * * *', 'select 1') > 0")" t
-psql -c "select cron.unschedule('smoke')" > /dev/null
+check initdb-order "$(psql -d app -c "select string_agg(step || ':' || by_user, ',' order by ctid) from init_log")" \
+  sourced:postgres,executed:postgres,after:postgres
+
+# The scheduler must run a job, not just accept one.
+psql -c 'create extension if not exists pg_cron' -c 'drop table if exists cron_smoke' -c 'create table cron_smoke (at timestamptz)'
+psql -c "select cron.schedule('smoke', '1 seconds', 'insert into cron_smoke values (now())')" > /dev/null
+ran=f
+for _ in $(seq 30); do
+  ran="$(psql -c 'select count(*) > 0 from cron_smoke')"
+  [ "$ran" = t ] && break
+  sleep 1
+done
+psql -c "select cron.unschedule('smoke')" -c 'drop table cron_smoke' > /dev/null
+check cron-runs "$ran" t
 
 psql -c 'drop database if exists smoke' -c 'create database smoke'
-# pg_cron can only live in cron.database_name, which is checked above.
-for ext in $(psql -d smoke -c "select name from pg_available_extensions where name not in ('pg_cron') order by 1"); do
+# pg_cron can only live in cron.database_name, which is checked above. Fetch
+# the list first, so a failed query fails the test instead of skipping the loop.
+exts="$(psql -d smoke -c "select name from pg_available_extensions where name not in ('pg_cron') order by 1")"
+check extension-count "$(($(wc -l <<< "$exts") >= 90))" 1
+for ext in $exts; do
   if out="$(psql -d smoke -c "create extension if not exists \"$ext\" cascade" 2>&1)"; then
     echo "ok   extension $ext"
   else

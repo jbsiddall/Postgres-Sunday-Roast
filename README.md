@@ -68,17 +68,32 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 | `POSTGRES_SHARED_PRELOAD_LIBRARIES` | `pg_stat_statements,pg_cron,pg_ivm,pg_duckdb` | Change what is preloaded. |
 | `POSTGRES_CRON_DATABASE` | `postgres` | Database that holds `pg_cron`'s tables. |
 
+`POSTGRES_PASSWORD`, `POSTGRES_USER`, `POSTGRES_DB` and `POSTGRES_INITDB_ARGS`
+can instead be read from a file, such as a Docker or Kubernetes secret, by
+setting `POSTGRES_PASSWORD_FILE` and so on. Setting both forms is an error.
+
 Settings: any arguments after the image name go to `postgres` and override the
-defaults:
+defaults, both during init scripts and afterwards. A leading `postgres` is
+optional, so Compose files written for the official image keep working:
 
 ```sh
 docker run ... ghcr.io/jbsiddall/postgres-sunday-roast:18 -c shared_buffers=1GB -c duckdb.max_memory=2GB
 ```
 
+Any other command, such as `psql`, `pg_dump` or `bash`, runs instead of the
+server.
+
 Init scripts: on first start, `*.sql`, `*.sql.gz` and `*.sh` files in
 `/docker-entrypoint-initdb.d` run once, in name order, against
-`POSTGRES_DB`. During that step the server only listens on its Unix socket, so
-clients cannot connect to a half-built database.
+`POSTGRES_DB`. An executable `*.sh` file is run; any other is sourced, with
+`"${psql[@]}"` set to a `psql` command for `POSTGRES_DB`. Both see
+`POSTGRES_USER` and `POSTGRES_DB`, and `PGHOST`, `PGUSER` and `PGDATABASE`, so
+a plain `psql` works too. During that step the server only listens on its Unix
+socket, so clients cannot connect to a half-built database.
+
+Stopping: the image's stop signal is `SIGINT`, so `docker stop` disconnects
+clients and shuts down cleanly instead of waiting for idle connections until
+the server is killed.
 
 Authentication: local socket connections are trusted, and every TCP connection
 must use a password (SCRAM-SHA-256). SSL is always on; to force it for TCP,
@@ -107,7 +122,27 @@ volumes:
 ### Kubernetes
 
 Set `securityContext.runAsUser`, `runAsGroup` and `fsGroup` to 999 and mount
-the volume at `/var/lib/postgresql`. Pin the image by digest
+the volume at `/var/lib/postgresql`.
+
+PostgreSQL refuses a private key that others can read. To use a certificate
+from a TLS Secret, mount it with `defaultMode: 0440`. The files are then owned
+by root with group 999 and mode 0440, which PostgreSQL accepts. The default of
+0644 makes the server refuse to start.
+
+```yaml
+      containers:
+        - name: postgres
+          env:
+            - { name: POSTGRES_SSL_CERT_FILE, value: /etc/postgres-tls/tls.crt }
+            - { name: POSTGRES_SSL_KEY_FILE, value: /etc/postgres-tls/tls.key }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/postgres-tls, readOnly: true }
+      volumes:
+        - name: tls
+          secret: { secretName: postgres-tls, defaultMode: 0440 }
+```
+
+Pin the image by digest
 (`ghcr.io/jbsiddall/postgres-sunday-roast@sha256:...`); each CI run prints the
 digest in its summary.
 
