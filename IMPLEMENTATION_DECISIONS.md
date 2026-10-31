@@ -134,8 +134,9 @@ execing s6. PostgREST gets all `PGRST_*` and pgweb its basic-auth pair.
 PostgreSQL, PostgREST and pgweb also get every other `PG*` variable, because
 those are libpq and server inputs (`PGSERVICEFILE`, `PGPASSFILE`, TLS paths).
 PgBouncer needs no environment with socket auth. Variables are listed with
-`${!PG@}`, not `compgen`: the image runs the entrypoint with a bash built
-without `compgen`, and there it fails silently. Disabled services get no environment file.
+`${!PG@}`, not `compgen`, which the entrypoint's bash lacks
+([Bash](DOMAIN_KNOWLEDGE.md#the-images-bash-has-no-compgen)). Disabled
+services get no environment file.
 Rejected: inheriting all expanded secrets in every process and putting secrets
 in argv. Cost: credential files remain in the writable runtime directory for
 service restarts; a shared uid and trusted socket are not a security boundary.
