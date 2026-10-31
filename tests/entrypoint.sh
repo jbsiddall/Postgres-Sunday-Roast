@@ -77,7 +77,7 @@ boot() {
   printf 'stub\n' > "$work/data/server.key"
   printf 'local all all reject\n' > "$work/data/pg_hba.conf"
   printf 'shared_buffers = 256MB\n' > "$work/data/postgresql.conf"
-  chmod 750 "$work/data"
+  chmod 700 "$work/data"
   snapshot > "$work/before"
   start "$@"
 }
@@ -87,7 +87,19 @@ start() {
     "${ENTRYPOINT_BASH:-bash}" -euo pipefail "$work/entrypoint.sh" > "$work/stdout" 2> "$work/stderr"
 }
 snapshot() {
-  (cd "$work/data"; find . -type f -exec sha256sum '{}' +; stat -c '%a %u %g' .)
+  snapshot_files
+  stat -c '%a %u %g' "$work/data"
+}
+snapshot_files() {
+  (cd "$work/data"; find . -type f -exec sha256sum '{}' +; find . -mindepth 1 -printf '%P %m %U %G\n')
+}
+data_mode() {
+  local actual
+  actual="$(stat -c %a "$1")"
+  if [ "$actual" != "$2" ]; then
+    echo "FAIL PGDATA mode: expected $2, got $actual" >&2
+    return 1
+  fi
 }
 has() {
   local entry
@@ -217,7 +229,7 @@ cmp "$work/before" "$work/after"
 test ! -e "$work/data/.psr-managed"
 test -n "$(find "$work/runtime" -name server.key -print)"
 if tr '\0' '\n' < "$work/results/postgres.argv" | grep -Eq 'ssl=|shared_preload_libraries=|max_worker_processes=|listen_addresses='; then exit 1; fi
-echo 'ok   imported cluster retains files, mode and server settings'
+echo 'ok   imported cluster retains files, 0700 mode and server settings'
 
 boot TEST_SSL=off POSTGRES_SSL_CERT_FILE="$work/data/server.crt" POSTGRES_SSL_KEY_FILE="$work/data/missing.key"
 snapshot > "$work/after"
@@ -265,6 +277,31 @@ test "$(grep -c '^initdb$' "$work/results/bootstrap")" = 1
 test "$(cat "$work/results/init-script")" = run
 tr '\0' '\n' < "$work/results/postgres.argv" | grep -qF ssl=on
 echo 'ok   fresh cluster initialises once and retains SSL defaults on restart'
+
+# Emulate kubelet's writable-directory mask on a later volume mount.
+chmod 2770 "$work/fresh"
+start PGDATA="$work/fresh" TEST_BOOTSTRAP=1 POSTGRES_HOST_AUTH_METHOD=trust \
+  PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+data_mode "$work/fresh" 700
+test "$(grep -c '^initdb$' "$work/results/bootstrap")" = 1
+test "$(cat "$work/results/init-script")" = run
+tr '\0' '\n' < "$work/results/postgres.argv" | grep -qF ssl=on
+echo 'ok   retained cluster repairs 2770 to 0700 without repeating initdb or scripts'
+
+boot TEST_SSL=off
+snapshot_files > "$work/before"
+owner="$(stat -c '%u %g' "$work/data")"
+for mode in 2770 750; do
+  chmod "$mode" "$work/data"
+  start TEST_SSL=off
+  data_mode "$work/data" 700
+  test "$(stat -c '%u %g' "$work/data")" = "$owner"
+  snapshot_files > "$work/after"
+  cmp "$work/before" "$work/after"
+  test ! -e "$work/data/.psr-managed"
+  if tr '\0' '\n' < "$work/results/postgres.argv" | grep -Eq 'ssl=|shared_preload_libraries=|max_worker_processes=|listen_addresses='; then exit 1; fi
+  echo "ok   imported cluster resets $mode to 0700; ownership, contents and settings retained"
+done
 
 # Run the workflow's audit itself with failing and successful Nix queries.
 audit="$(sed -n '/^          closure=/,/^          if grep systemd/p' "$repo/.github/workflows/image.yml")"

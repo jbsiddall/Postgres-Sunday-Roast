@@ -56,7 +56,25 @@ that override; never move or delete data. A volume for another uid needs
 ownership corrected before startup; running as root and dropping privileges
 would break `runAsNonRoot` and require another helper.
 
-Imported clusters retain their files, directory mode, authentication and
+Choice: on every start, reset an existing PGDATA owned by the current user to
+mode 0700, like the official entrypoint. Only chmod the directory itself,
+never chown or change its contents. As upstream does, ignore chmod failure
+and let PostgreSQL check access. This repairs mode 2770 after kubelet reapplies
+`fsGroup` to a retained or imported cluster. Rejected: preserving every existing
+mode, which prevents those clusters from restarting; requiring deployments to
+avoid `fsGroup`; and checking mode bits to repair only rejected modes while
+preserving 0750, which adds a separate policy from upstream. Cost: existing
+0750 clusters lose group access through PGDATA on restart, as they do under
+the official image; their contained files keep their modes. This is the
+smallest change that matches upstream and keeps its clusters starting.
+Evidence, checked 2026-10-31: the pinned
+[official entrypoint](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh#L39-L41)
+runs `chmod 00700 "$PGDATA" || :`; its directory setup runs before the
+existing-cluster check. Check: `tests/entrypoint.sh` covers retained and
+imported clusters at 2770, existing 0700, and imported 0750 resetting to 0700,
+with ownership, contained files and server settings preserved.
+
+Imported clusters retain their files, authentication and
 server settings. Only the socket path is supplied for bundled services;
 explicit environment and command-line overrides still apply. Fresh clusters
 get a `.psr-managed` marker to retain this image's defaults on restart.

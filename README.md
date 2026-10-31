@@ -286,9 +286,18 @@ volumes:
 
 ### Kubernetes
 
-For new clusters, set `securityContext.runAsUser`, `runAsGroup` and `fsGroup`
-to 999 and mount the volume at `/var/lib/postgresql`. `runAsNonRoot: true` is
-supported. With `readOnlyRootFilesystem: true`, also mount writable `emptyDir`
+For new and imported clusters, set `securityContext.runAsUser`, `runAsGroup`
+and `fsGroup` to 999 and mount the volume at `/var/lib/postgresql`.
+`runAsNonRoot: true` is supported. On volumes that support it, `fsGroup`
+makes the mount writable so 999:999 can create PGDATA. Imported clusters must
+already be owned by uid 999; the entrypoint never changes ownership. On every
+start it resets an existing PGDATA owned by the current user to mode 0700,
+matching the official image.
+This repairs permissions broadened by kubelet on a remount and also resets
+0750 clusters created with `initdb --allow-group-access`. Files and directories
+inside PGDATA are left alone.
+
+With `readOnlyRootFilesystem: true`, also mount writable `emptyDir`
 volumes at
 `/run/postgresql`, `/run/psr-services` (s6 state and generated configuration)
 and `/tmp`.
@@ -296,7 +305,7 @@ Kubernetes `emptyDir` volumes permit execution by default; no Docker-style
 `exec` option is needed. A cluster policy or mount override must not make
 `/run/psr-services` `noexec`.
 
-Do not use `fsGroup` on an imported volume; follow
+For the remaining import checks, follow
 [Switching from the official image](#switching-from-the-official-image).
 
 PostgreSQL refuses a private key that others can read. To use a certificate
@@ -370,18 +379,21 @@ This does not cover Alpine images, another architecture or another major version
      runAsUser: 999
      runAsGroup: 999
      runAsNonRoot: true
+     fsGroup: 999
    ```
 
-   `fsGroup` is omitted because kubelet can recursively broaden an imported
-   data directory's permissions to 2770, which PostgreSQL rejects.
-   PostgreSQL requires the data directory to be owned by the server user with
-   mode 0700 or 0750. Arrange the correct ownership and mode
-   before starting; this entrypoint does not chown or chmod an existing cluster.
+   As for new clusters, the entrypoint resets the PGDATA directory itself to
+   mode 0700 on every start when owned by the current user, including after
+   `fsGroup` has broadened it to 2770. The
+   [official entrypoint at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh#L39-L41)
+   does the same, including resetting mode 0750 to 0700. Group access through
+   PGDATA is therefore removed; its contents are left alone. Arrange ownership
+   before starting; this entrypoint never chowns an existing cluster.
    See [Kubernetes volume ownership](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#configure-volume-permission-and-ownership-change-policy-for-pods).
    With a read-only root filesystem, mount default `emptyDir: {}` volumes at
    `/run/postgresql`, `/run/psr-services` and `/tmp`; Kubernetes v1.35.0
    [creates them with mode 0777](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go),
-   so all three paths are writable as 999:999 without `fsGroup`.
+   so all three paths are writable as 999:999 even without `fsGroup`.
    Keep `/run/psr-services` executable, as above.
    For example, with Docker:
 

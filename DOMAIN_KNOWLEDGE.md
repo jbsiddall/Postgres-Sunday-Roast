@@ -53,7 +53,7 @@ and [error statuses](https://github.com/PostgREST/postgrest/blob/v14.16/src/Post
 
 ## Kubernetes
 
-### fsGroup can invalidate imported PostgreSQL directory permissions
+### fsGroup broadens PostgreSQL directory permissions
 
 Read on 2026-10-31: kubelet v1.35.0's
 [volume ownership handling](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/volume_linux.go)
@@ -65,16 +65,12 @@ rwx and setgid into every directory, changing PGDATA mode 0700 or 0750 to
 creates `/var/lib/postgresql` as 1777, without setgid. The 2026-10-31 review
 reproduced PostgreSQL 18.6 refusing mode 2770 with "invalid permissions" and
 requiring 0700 or 0750; this was a local permission reproduction, not a
-Kubernetes deployment test. Omit `fsGroup` for an imported volume that
-already belongs to 999:999; this entrypoint preserves existing PGDATA modes.
+Kubernetes deployment test.
 
 The v1.35.0
 [emptyDir implementation](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go)
-creates default volumes with mode 0777 and corrects restrictive umasks with
-chmod. Thus default `emptyDir: {}` mounts at `/run/postgresql`,
-`/run/psr-services` and `/tmp` remain writable as 999:999 without `fsGroup`,
-including with a read-only container root. This is a source observation,
-checked on 2026-10-31.
+creates default directory-backed volumes with mode 0777 and corrects
+restrictive umasks with chmod. Read on 2026-10-31.
 
 ## PostgreSQL
 
@@ -84,9 +80,12 @@ Read on 2026-10-31: official
 [Dockerfile commit e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/Dockerfile)
 sets `PGDATA=/var/lib/postgresql/18/docker`, declares
 `VOLUME /var/lib/postgresql`, and creates `postgres` uid/gid 999.
-Its [entrypoint at that commit](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/docker-entrypoint.sh)
+Its [entrypoint at that commit](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh)
 invokes initdb with username, password file, user `POSTGRES_INITDB_ARGS`
 and optional `--waldir`. It supplies no default checksum-disabling flag.
+Before checking whether a cluster already exists, it calls
+`docker_create_db_directories`, which runs `chmod 00700 "$PGDATA" || :`.
+Existing 0750 directories are reset to 0700 as well as 2770 directories.
 The [PostgreSQL 18 initdb reference](https://www.postgresql.org/docs/18/app-initdb.html)
 says checksums are enabled by default. These are source observations, not a
 container test.
@@ -120,6 +119,11 @@ labels `float8ByVal` as applying to float8 and int8; the
 defines timestamps as int64.
 
 ## Unverified
+
+[unverified: no live Kubernetes deployment check] Starting this image as
+999:999 with a read-only root and default `emptyDir: {}` mounts at
+`/run/postgresql`, `/run/psr-services` and `/tmp` remains an inference from
+kubelet v1.35.0 source and the image's startup writes, read on 2026-10-31.
 
 [unverified: no container runtime in the editing environment] The official
 volume round trip and whether this exact glibc change logs a collation-version

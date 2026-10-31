@@ -88,6 +88,10 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
   fresh=1
   mkdir -p "$PGDATA"
   chmod 700 "$PGDATA"
+elif [ -O "$PGDATA" ]; then
+  # Like the official image, repair directory permissions on every start.
+  # A volume remount with fsGroup can add group-write and setgid bits.
+  chmod 00700 "$PGDATA" || :
 fi
 managed="$fresh"
 if [ -f "$PGDATA/.psr-managed" ]; then managed=1; fi
