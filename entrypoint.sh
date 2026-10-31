@@ -255,6 +255,8 @@ max_client_conn = ${PGBOUNCER_MAX_CLIENT_CONN:-100}
 client_tls_sslmode = allow
 client_tls_cert_file = $cert
 client_tls_key_file = $key
+# Without a CA file, libtls looks for a system bundle the image does not have.
+client_tls_ca_file = $SSL_CERT_FILE
 admin_users = $POSTGRES_USER
 stats_users = $POSTGRES_USER
 EOF
