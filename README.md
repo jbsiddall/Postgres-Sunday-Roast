@@ -3,7 +3,7 @@
 PostgreSQL 18 with all the trimmings: one container image with 92 extensions
 ready to `CREATE EXTENSION`. It includes vectors, geospatial, DuckDB analytics,
 cron jobs, incremental views, queues, GraphQL, and Python and JavaScript
-functions, with SSL on from the first start.
+functions, with SSL on for new clusters.
 
 It is built with [Nix](https://nixos.org) from a pinned nixpkgs, so every build
 uses the same inputs. It runs as a non-root user and follows the official
@@ -44,7 +44,8 @@ modules that are loaded rather than created: `safeupdate` (blocks `UPDATE` and
 `auto_explain`. To see the full list with versions, run
 `select name, default_version from pg_available_extensions order by 1`.
 
-`pg_stat_statements`, `pg_cron`, `pg_ivm` and `pg_duckdb` are preloaded.
+For clusters created by this image, `pg_stat_statements`, `pg_cron`, `pg_ivm`
+and `pg_duckdb` are preloaded.
 `pg_cron` lives in the `postgres` database, and its jobs run in background
 workers, so they need no password.
 
@@ -61,12 +62,12 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 | `POSTGRES_PASSWORD` | required on first start | Password of `POSTGRES_USER`. Optional for an existing cluster or with `POSTGRES_HOST_AUTH_METHOD=trust`. |
 | `POSTGRES_USER` | `postgres` | Superuser created on first start. |
 | `POSTGRES_DB` | `$POSTGRES_USER` | Database created on first start. |
-| `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--data-checksums`. |
+| `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--no-data-checksums` (18 enables checksums by default). |
 | `POSTGRES_INITDB_WALDIR` | inside `PGDATA` | Put the write-ahead log in another directory, e.g. a faster volume. |
 | `LANG` | `en_US.UTF-8` | Locale of a new cluster. `C.UTF-8` is the only other locale in the image. |
 | `POSTGRES_HOST_AUTH_METHOD` | `scram-sha-256` | Authentication for TCP connections. `trust` needs no password from anyone who can reach the port, so use it only for throwaway local databases. |
-| `PGDATA` | `/var/lib/postgresql/18/data` | Data directory. Mount a volume at `/var/lib/postgresql`. |
-| `POSTGRES_SSL_CERT_FILE`, `POSTGRES_SSL_KEY_FILE` | self-signed in `$PGDATA` | Use your own certificate, e.g. from a Kubernetes secret. |
+| `PGDATA` | `/var/lib/postgresql/18/docker` | Data directory. Mount a volume at `/var/lib/postgresql`. |
+| `POSTGRES_SSL_CERT_FILE`, `POSTGRES_SSL_KEY_FILE` | self-signed under `/run/psr-services` for new clusters | Use your own certificate, e.g. from a Kubernetes secret. |
 | `POSTGRES_SSL_CN` | `postgres` | Common name of the generated certificate. |
 | `POSTGRES_SHARED_PRELOAD_LIBRARIES` | `pg_stat_statements,pg_cron,pg_ivm,pg_duckdb` | Change what is preloaded. |
 | `POSTGRES_CRON_DATABASE` | `postgres` | Database that holds `pg_cron`'s tables. |
@@ -124,13 +125,13 @@ PostgreSQL `SIGINT` for a fast shutdown, disconnecting busy clients cleanly.
 If PostgreSQL exits unexpectedly, the container exits too; s6 restarts the
 other services if they fail. Service output goes to the container log.
 
-Authentication: local socket connections are trusted, and every TCP connection
+Authentication on new clusters: local socket connections are trusted, and every TCP connection
 must use a password (SCRAM-SHA-256, unless `POSTGRES_HOST_AUTH_METHOD` says
-otherwise). SSL is always on; to force it for TCP,
+otherwise). New clusters have SSL on; to force it for TCP,
 change `host` to `hostssl` in `pg_hba.conf`.
 
-User: the server runs as uid and gid 999. If a volume was created for a
-different uid, `chown -R 999:999` it first.
+User: the server runs as uid and gid 999. Follow the
+[volume preparation procedure](#kubernetes) before attaching a volume.
 
 ## Services
 
@@ -285,34 +286,134 @@ volumes:
 
 ### Kubernetes
 
-Set `securityContext.runAsUser`, `runAsGroup` and `fsGroup` to 999 and mount
-the volume at `/var/lib/postgresql`. `runAsNonRoot: true` is supported. With
-`readOnlyRootFilesystem: true`, also mount writable `emptyDir` volumes at
-`/run/postgresql`, `/run/psr-services` (s6 state and generated configuration)
-and `/tmp`, owned by uid 999 or writable through `fsGroup: 999`.
-Kubernetes `emptyDir` volumes permit execution by default; no Docker-style
-`exec` option is needed. A cluster policy or mount override must not make
-`/run/psr-services` `noexec`.
+For new and imported clusters, set `securityContext.runAsUser` and
+`runAsGroup` to 999, with `runAsNonRoot: true`, and mount the data volume at
+`/var/lib/postgresql`. A PVC does not inherit the image directory's ownership;
+the entrypoint never changes ownership. Prepare the volume once:
 
-PostgreSQL refuses a private key that others can read. To use a certificate
-from a TLS Secret, mount it with `defaultMode: 0440`. The files are then owned
-by root with group 999 and mode 0440, which PostgreSQL accepts. The default of
-0644 makes the server refuse to start.
+1. With PostgreSQL stopped, mount the data PVC read-write at
+   `/var/lib/postgresql` in a one-off maintenance pod. Run its utility container
+   as UID/GID 0 (`runAsUser: 0`, `runAsGroup: 0`, `runAsNonRoot: false`),
+   without pod-wide `fsGroup`.
+2. For an **empty volume only**, change just the mount root:
+
+   ```sh
+   chown 999:999 /var/lib/postgresql
+   chmod u+rwx /var/lib/postgresql
+   ```
+
+   The database process creates its own restricted PGDATA beneath it. For an
+   imported official cluster already owned by 999:999, keep its ownership and
+   file modes; do not recursively chown it. For a different database UID, use a
+   maintenance container with GNU `find`, `stat` and `chown`. Read it with
+   `old_uid="$(stat -c %u /var/lib/postgresql/18/docker)"`, confirm it is the
+   expected nonzero database UID, then remap only that owner's files:
+
+   ```sh
+   find /var/lib/postgresql/18/docker -xdev -uid "$old_uid" -exec chown -h 999:999 '{}' +
+   ```
+
+   Ensure 999 can traverse `/var/lib/postgresql` and its `18` directory. Prepare
+   separately mounted WAL and tablespaces at their own mount paths. Preserve
+   root-owned TLS keys as root:999 with mode 0640; database-owned keys must stay
+   0600. Do not use recursive chmod or change root-owned 0640 keys to database
+   ownership without also restricting them to 0600.
+3. Remove the maintenance pod before starting PostgreSQL as 999:999. If policy
+   or the storage backend disallows these ownership changes, have the storage
+   administrator perform the same preparation before attaching the PVC.
+
+Do not set pod-wide `fsGroup`. Kubelet's recursive permission pass changes file
+modes inside supported volumes: a database-owned TLS key at 0600 becomes 0660,
+which [PostgreSQL 18 rejects](https://www.postgresql.org/docs/18/ssl-tcp.html).
+SSL keys on data volumes changed by `fsGroup` are unsupported. Before reusing
+such a volume, remove `fsGroup` and restore affected key permissions separately
+while the database is stopped. The entrypoint leaves every file inside PGDATA
+alone, including keys. Its generated keys live outside PGDATA under
+`/run/psr-services/tls.*`, with mode 0600; supplied keys stay at their configured
+paths and retain their modes.
+
+On every start, the entrypoint resets an existing PGDATA owned by the current
+user to mode 0700, matching the official image. This repairs the directory
+itself if a previous mount used `fsGroup` and also resets 0750 clusters created
+with `initdb --allow-group-access`. It does not repair file modes inside it.
+See the [kubelet v1.35.0 permission masks](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/volume_linux.go).
+
+With `readOnlyRootFilesystem: true`, also mount writable default
+`emptyDir: {}` volumes at `/run/postgresql`, `/run/psr-services` (s6 state,
+generated configuration and TLS keys) and `/tmp`. Kubelet v1.35.0
+[creates these directory-backed mounts with mode 0777](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go),
+so 999:999 can write without `fsGroup`. They permit execution by default; no
+Docker-style `exec` option is needed. A cluster policy or mount override must
+not make `/run/psr-services` `noexec`.
+
+For the remaining import checks, follow
+[Switching from the official image](#switching-from-the-official-image).
+
+For a supplied TLS pair, set `POSTGRES_SSL_CERT_FILE` and
+`POSTGRES_SSL_KEY_FILE` to the mounted paths. Prepare the key as owned by 999
+with mode 0600, or by root with mode 0640 and group 999, and ensure 999:999 can
+traverse its parent directories and read the certificate. A Kubernetes TLS
+Secret's `defaultMode` alone does not give its root-owned key group 999 without
+`fsGroup`. Merge this fragment into your database pod, keeping its prepared data
+volume, runtime mounts and password/service environment:
 
 ```yaml
-      containers:
-        - name: postgres
-          env:
-            - { name: POSTGRES_SSL_CERT_FILE, value: /etc/postgres-tls/tls.crt }
-            - { name: POSTGRES_SSL_KEY_FILE, value: /etc/postgres-tls/tls.key }
-          volumeMounts:
-            - { name: tls, mountPath: /etc/postgres-tls, readOnly: true }
-      volumes:
-        - name: tls
-          secret: { secretName: postgres-tls, defaultMode: 0440 }
+spec:
+  securityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    runAsNonRoot: true
+  initContainers:
+    - name: prepare-tls
+      image: ghcr.io/jbsiddall/postgres-sunday-roast:18
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+          add: [CHOWN]
+      command: [/bin/bash, -euc]
+      args:
+        - |
+          umask 077
+          mkdir -p /tls-ready/pair
+          cp /tls-source/tls.crt /tls-ready/pair/server.crt
+          cp /tls-source/tls.key /tls-ready/pair/server.key
+          chmod 0700 /tls-ready/pair
+          chmod 0600 /tls-ready/pair/server.crt /tls-ready/pair/server.key
+          chown 999:999 /tls-ready/pair/server.crt /tls-ready/pair/server.key
+          chown 999:999 /tls-ready/pair
+      volumeMounts:
+        - { name: tls-source, mountPath: /tls-source, readOnly: true }
+        - { name: tls-ready, mountPath: /tls-ready }
+  containers:
+    - name: postgres
+      image: ghcr.io/jbsiddall/postgres-sunday-roast:18
+      env:
+        - { name: POSTGRES_SSL_CERT_FILE, value: /etc/postgres-tls/pair/server.crt }
+        - { name: POSTGRES_SSL_KEY_FILE, value: /etc/postgres-tls/pair/server.key }
+      volumeMounts:
+        - { name: tls-ready, mountPath: /etc/postgres-tls, readOnly: true }
+  volumes:
+    - name: tls-source
+      secret:
+        secretName: postgres-tls
+        defaultMode: 0400
+    - name: tls-ready
+      emptyDir: {}
 ```
 
-Pin the image by digest
+UID 0 can read the root-owned 0400 Secret as its owner and write into the
+default 0777 `emptyDir` described above; only the ownership transfer needs
+`CHOWN`. The copy ends as 999:999 with a 0600 key in a 0700 directory. After
+updating the Secret, recreate the pod to rerun the init container for rotation.
+If policy disallows a root init container, use an administrator-prepared mount
+with the same final access. Do not broaden the key's permissions.
+
+Pin both image references by digest
 (`ghcr.io/jbsiddall/postgres-sunday-roast@sha256:...`); each CI run prints the
 digest in its summary.
 
@@ -337,18 +438,163 @@ dependencies never end up in it. PgBouncer is built without systemd and
 PostgREST uses its binary output to keep the runtime closure small. The biggest
 parts are Python (for PL/Python), DuckDB, GDAL and PROJ (for PostGIS) and ICU.
 
-## Upgrading from the official image
+## Switching from the official image
 
-The data format is the same PostgreSQL 18 format, but the official Debian
-image and this one link against different glibc versions. Text indexes can
-sort differently between glibc versions, so don't point this image at an
-existing data directory. Instead, dump and restore, which rebuilds the indexes:
+Mount an official PostgreSQL 18 volume at `/var/lib/postgresql` without a
+`PGDATA` override. Both images use `/var/lib/postgresql/18/docker` and the
+Debian official image's `postgres` user is 999:999. Verified on 2026-10-31
+against [Dockerfile commit e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/Dockerfile).
+This does not cover Alpine images, another architecture or another major version.
 
-```sh
-docker exec old-pg pg_dumpall -U postgres > dump.sql
-docker run -d --name pg -e POSTGRES_PASSWORD=... -v newdata:/var/lib/postgresql ghcr.io/jbsiddall/postgres-sunday-roast:18
-docker exec -i pg psql -U postgres -h /run/postgresql < dump.sql
-```
+1. Back up first and test restoring the backup. Record the old image digest,
+   PostgreSQL version, `SHOW data_checksums`, database locales and installed
+   extensions (`SELECT extname, extversion FROM pg_extension` in each database).
+   Stop application traffic, then stop the old container cleanly. Keep a stopped
+   copy or snapshot of the volume; never run both servers against it. Dump and
+   restore into a new volume remains an alternative that rebuilds indexes.
+2. Check the stopped cluster with `pg_controldata -D /var/lib/postgresql/18/docker`
+   using a one-off container and the same volume. Keep PostgreSQL major version
+   18 and architecture unchanged. Preserve mounts for external WAL, tablespaces,
+   certificates and included configuration, at their original paths. Confirm
+   the target has the locales and extension libraries the cluster uses; this
+   image contains only `en_US.UTF-8` and `C.UTF-8` glibc locales.
+3. Mount the same volume and run as 999:999. For Kubernetes, use this pod
+   security context (the volume must already belong to 999:999):
+
+   ```yaml
+   securityContext:
+     runAsUser: 999
+     runAsGroup: 999
+     runAsNonRoot: true
+   ```
+
+   Follow the imported-cluster branch of the
+   [volume preparation procedure](#kubernetes); do not set `fsGroup`. The
+   entrypoint resets only the PGDATA directory to 0700 when owned by the
+   current user, including a directory previously broadened to
+   2770. The
+   [official entrypoint at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh#L39-L41)
+   does the same, including resetting mode 0750 to 0700. Group access through
+   PGDATA is therefore removed; its contents are left alone. This entrypoint
+   never chowns an existing cluster or repairs TLS key modes.
+   With a read-only root filesystem, use the three writable default `emptyDir`
+   mounts described above and keep `/run/psr-services` executable.
+   For example, with Docker:
+
+   ```sh
+   docker run -d --name pg --user 999:999 \
+     -e PGBOUNCER_ENABLED=false -e POSTGREST_ENABLED=false \
+     -v pgdata:/var/lib/postgresql ghcr.io/jbsiddall/postgres-sunday-roast:18
+   ```
+
+4. Before reopening traffic, inspect logs and connect to every application
+   database. Confirm your rows, checksums, authentication, SSL, extensions and
+   settings. The entrypoint skips initdb and init scripts, leaves `pg_hba.conf`,
+   configuration and certificates alone, and preserves existing server settings.
+   It supplies `unix_socket_directories=/run/postgresql` for bundled services;
+   command arguments still win. It does not replace an imported preload list,
+   worker limits, listen addresses or SSL policy. Explicit SSL/preload/cron
+   environment variables still override their settings. Enable bundled services
+   only after checking their trusted-socket and role requirements above.
+   Set `POSTGRES_USER` and `POSTGRES_DB` to existing roles and databases;
+   setting `POSTGRES_PASSWORD` does not reset an existing role's password.
+   PgBouncer generates its own runtime certificate when PostgreSQL has SSL off.
+5. Resolve collation changes before serving queries. The pinned official
+   `postgres:18` (18.6, trixie) contains Debian glibc 2.41
+   (`libc6 2.41-12+deb13u4`); this flake's nixpkgs pin contains glibc 2.44.
+   Sources: [Debian libc6](https://packages.debian.org/trixie/libc6),
+   [pinned Nix definition](https://github.com/NixOS/nixpkgs/blob/1c89083e451e891152365b799595cf7790a43325/pkgs/development/libraries/glibc/common.nix).
+   Check your actual old digest; older Debian tags can differ. A "collation
+   version mismatch" warning means the recorded version differs from the
+   current provider. It does not block startup or rebuild anything. B-tree
+   indexes on `text`/`varchar` (including primary keys), expression indexes
+   and other objects that depend on changed libc or ICU collations can retain
+   an obsolete order. Index scans may return wrong results without an error;
+   an absence of warnings does not prove the sort rules are unchanged.
+   [Binary `C`/`POSIX` collations](https://www.postgresql.org/docs/18/collation.html)
+   do not use language-specific sort rules.
+   See [PostgreSQL's collation guidance](https://www.postgresql.org/docs/18/sql-altercollation.html).
+
+   Connect as a superuser to each affected database, including `postgres`
+   and any template database with affected objects. Rebuild affected indexes
+   first; rebuilding all user indexes in the database is a conservative option:
+
+   ```sql
+   -- Connected to app, with application traffic stopped.
+   REINDEX DATABASE app;
+   ALTER DATABASE app REFRESH COLLATION VERSION;
+   ```
+
+   `REINDEX DATABASE` runs outside a transaction. Resolve any duplicate-key
+   errors and rebuild other collation-dependent objects before refreshing.
+   It excludes system catalogs; use `REINDEX SYSTEM app` if their indexes
+   are affected too. See [REINDEX](https://www.postgresql.org/docs/18/sql-reindex.html).
+   For explicitly named collations, also rebuild their dependent objects and
+   then run `ALTER COLLATION schema.collation_name REFRESH VERSION` in that
+   database. List mismatches with:
+
+   ```sql
+   SELECT datname, datcollversion, pg_database_collation_actual_version(oid)
+   FROM pg_database
+   WHERE datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid);
+
+   SELECT oid::regcollation, collversion, pg_collation_actual_version(oid)
+   FROM pg_collation
+   WHERE collversion IS DISTINCT FROM pg_collation_actual_version(oid);
+   ```
+
+   Refreshing version metadata alone only silences the warning. It does not
+   repair indexes. See [ALTER DATABASE](https://www.postgresql.org/docs/18/sql-alterdatabase.html).
+6. Compare extensions in every database with `pg_available_extension_versions`.
+   A missing `shared_preload_libraries` entry prevents startup; other missing
+   libraries can fail when a function is first used. Restore compatible
+   libraries or rebuild the image. Where supported by the extension's upgrade
+   path, run `ALTER EXTENSION extension_name UPDATE` (or `UPDATE TO 'version'`)
+   in each database, then test its functions. Changing images does not update
+   extension SQL objects automatically. Do not assume an older bundled version
+   can read a newer extension's data. See [ALTER EXTENSION](https://www.postgresql.org/docs/18/sql-alterextension.html)
+   and [shared library preloading](https://www.postgresql.org/docs/18/runtime-config-client.html#RUNTIME-CONFIG-CLIENT-PRELOAD).
+
+### Binary compatibility and checksums
+
+PostgreSQL checks `PG_VERSION` and `pg_control` at startup. A different major
+version, control/catalog format, data or WAL block size, alignment, floating-point
+format, or float8/int8 pass-by-value ABI fails loudly. PostgreSQL 18 always uses
+integer timestamps; the old integer-versus-float timestamp build option is not
+an 18 setting. A valid WAL segment size is read from the cluster (powers of two
+from 1 MB to 1 GB); it need not equal initdb's default of 16 MB. Invalid sizes
+fail at startup. These checks do not detect collation ordering problems.
+Sources: [18.6 control checks](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/transam/xlog.c),
+[major-version check](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/init/miscinit.c),
+[control fields](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_control.h),
+[timestamp types](https://github.com/postgres/postgres/blob/REL_18_6/src/include/datatype/timestamp.h).
+
+PostgreSQL 18 initdb enables data checksums by default. The official entrypoint
+passes the username and password file, optional `--waldir`, and user-supplied
+`POSTGRES_INITDB_ARGS`; it does not disable checksums by default. Reusing a
+cluster preserves its checksum setting, including an explicit
+`--no-data-checksums`. Check `SHOW data_checksums` after startup; optionally
+run `pg_checksums --check` on a cleanly stopped checksummed cluster.
+Sources: [initdb](https://www.postgresql.org/docs/18/app-initdb.html),
+[official entrypoint at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/docker-entrypoint.sh),
+[pg_checksums](https://www.postgresql.org/docs/18/app-pgchecksums.html),
+[pg_controldata](https://www.postgresql.org/docs/18/app-pgcontroldata.html).
+
+### Existing PSR volumes
+
+Earlier builds used `/var/lib/postgresql/18/data`. Keep that volume and set
+`PGDATA=/var/lib/postgresql/18/data`. If the new default has no cluster and
+that old path has `PG_VERSION`, startup refuses to initialise a new database
+and prints this override. No migration, move, deletion or symlink is performed.
+
+Clusters created by this build have a `.psr-managed` marker so the image's
+SSL, preload and worker defaults also apply on restart. Imported clusters,
+including older PSR clusters without the marker, keep their stored settings.
+For older PSR clusters that relied on command-line defaults, explicitly set
+`POSTGRES_SHARED_PRELOAD_LIBRARIES`, SSL certificate/key variables and other
+needed server arguments when recreating the container. Generated certificates
+now live in unique directories under `/run/psr-services`; they are regenerated
+on restart. Mount your own pair for stable certificate identity.
 
 ## Build it yourself
 
@@ -378,6 +624,17 @@ preloaded libraries, init scripts and `pg_cron`, then creates every available
 extension. CI also checks service
 switches and shutdown, runs on every pull request and pushes the image to GHCR
 from `main`.
+
+The volume reuse test creates a disposable volume using a digest-pinned
+`postgres:18`, stops it cleanly, and checks its rows, cluster identity,
+checksums and configuration in this image without a `PGDATA` override.
+It prints `collation-version-warning: yes` or `no` without failing on the
+warning, and removes the containers and volume even on failure:
+
+```sh
+tests/official-volume.sh postgres-sunday-roast:18.6 podman
+# Or: tests/official-volume.sh postgres-sunday-roast:18.6 docker
+```
 
 ## Not included
 

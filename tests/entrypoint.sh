@@ -1,24 +1,57 @@
 #!/usr/bin/env bash
-# Exercise credential routing without PostgreSQL, s6 or a container runtime.
+# Exercise startup without PostgreSQL, s6 or a container runtime.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d "$repo/.entrypoint-test.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/bin"
-sed "s|runtime=/run/psr-services|runtime=$work/runtime|" "$repo/entrypoint.sh" > "$work/entrypoint.sh"
+mkdir -p "$work/bin" "$work/initdb"
+sed -e "s|runtime=/run/psr-services|runtime=$work/runtime|" \
+  -e "s|initdb_dir=/docker-entrypoint-initdb.d|initdb_dir=$work/initdb|" \
+  -e "s|/var/lib/postgresql|$work/volume|g" "$repo/entrypoint.sh" > "$work/entrypoint.sh"
 cat > "$work/bin/postgres" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${*: -2:1}" = -C ]]; then
   case "${*: -1}" in
     port) echo 5432 ;;
+    ssl) echo "${TEST_SSL:-on}" ;;
     ssl_cert_file) echo "$TEST_DATA/server.crt" ;;
     ssl_key_file) echo "$TEST_DATA/server.key" ;;
   esac
 else
   env -0 > "$TEST_RESULTS/postgres"
+  printf '%s\0' "$@" > "$TEST_RESULTS/postgres.argv"
 fi
 EOF
+cat > "$work/bin/openssl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -out | -keyout) printf 'generated\n' > "$2"; shift ;;
+  esac
+  shift
+done
+EOF
+for name in initdb pg_ctl psql; do
+  cat > "$work/bin/$name" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${TEST_BOOTSTRAP:-}" = 1 ]; then
+  echo "${0##*/}" >> "$TEST_RESULTS/bootstrap"
+  case "${0##*/}" in
+    initdb)
+      printf '18\n' > "$PGDATA/PG_VERSION"
+      touch "$PGDATA/pg_hba.conf" "$PGDATA/postgresql.conf"
+      ;;
+    psql) echo 1 ;;
+  esac
+  exit
+fi
+echo "Unexpected bootstrap command: ${0##*/}" >&2
+exit 99
+EOF
+done
 cat > "$work/bin/s6-svscan" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -42,9 +75,31 @@ boot() {
   printf '18\n' > "$work/data/PG_VERSION"
   printf 'stub\n' > "$work/data/server.crt"
   printf 'stub\n' > "$work/data/server.key"
+  printf 'local all all reject\n' > "$work/data/pg_hba.conf"
+  printf 'shared_buffers = 256MB\n' > "$work/data/postgresql.conf"
+  chmod 700 "$work/data"
+  snapshot > "$work/before"
+  start "$@"
+}
+start() {
   env -i PATH="$work/bin:$PATH" PGDATA="$work/data" TEST_DATA="$work/data" \
     TEST_RESULTS="$work/results" SSL_CERT_FILE=/unused "$@" \
     "${ENTRYPOINT_BASH:-bash}" -euo pipefail "$work/entrypoint.sh" > "$work/stdout" 2> "$work/stderr"
+}
+snapshot() {
+  snapshot_files
+  stat -c '%a %u %g' "$work/data"
+}
+snapshot_files() {
+  (cd "$work/data"; find . -type f -exec sha256sum '{}' +; find . -mindepth 1 -printf '%P %m %U %G\n')
+}
+data_mode() {
+  local actual
+  actual="$(stat -c %a "$1")"
+  if [ "$actual" != "$2" ]; then
+    echo "FAIL PGDATA mode: expected $2, got $actual" >&2
+    return 1
+  fi
 }
 has() {
   local entry
@@ -167,6 +222,133 @@ done
 absent pgbouncer PGSERVICEFILE
 isolated
 echo 'ok   libpq inputs reach the services that connect with libpq'
+
+boot TEST_SSL=off
+snapshot > "$work/after"
+cmp "$work/before" "$work/after"
+test ! -e "$work/data/.psr-managed"
+test -n "$(find "$work/runtime" -name server.key -print)"
+if tr '\0' '\n' < "$work/results/postgres.argv" | grep -Eq 'ssl=|shared_preload_libraries=|max_worker_processes=|listen_addresses='; then exit 1; fi
+echo 'ok   imported cluster retains files, 0700 mode and server settings'
+
+boot TEST_SSL=off POSTGRES_SSL_CERT_FILE="$work/data/server.crt" POSTGRES_SSL_KEY_FILE="$work/data/missing.key"
+snapshot > "$work/after"
+cmp "$work/before" "$work/after"
+test ! -e "$work/data/missing.key"
+echo 'ok   supplied certificate paths are never generated or overwritten'
+
+boot
+touch "$work/data/.psr-managed"
+start
+tr '\0' '\n' < "$work/results/postgres.argv" | grep -qF shared_preload_libraries=pg_stat_statements,pg_cron,pg_ivm,pg_duckdb
+test -n "$(find "$work/runtime" -name server.key -print)"
+echo 'ok   PSR-created clusters retain defaults on restart'
+
+mkdir -p "$work/volume/18/data"
+printf '18\n' > "$work/volume/18/data/PG_VERSION"
+if start PGDATA="$work/volume/18/docker"; then exit 1; fi
+grep -qF "Set PGDATA=$work/volume/18/data" "$work/stderr"
+test ! -e "$work/volume/18/docker"
+test "$(cat "$work/volume/18/data/PG_VERSION")" = 18
+if grep -qF 'Unexpected bootstrap command' "$work/stderr"; then exit 1; fi
+mkdir -p "$work/volume/18/docker"
+if start PGDATA="$work/volume/18/docker"; then exit 1; fi
+test -z "$(ls -A "$work/volume/18/docker")"
+# A cluster at the new path takes precedence over the old path.
+printf '18\n' > "$work/volume/18/docker/PG_VERSION"
+start PGDATA="$work/volume/18/docker" TEST_SSL=off
+# The explicit old path must still start, including the bundled services.
+start PGDATA="$work/volume/18/data" TEST_SSL=off
+test -f "$work/results/postgres"
+echo 'ok   earlier PSR volume blocks initdb and accepts the PGDATA override'
+
+cat > "$work/initdb/01-once.sh" <<'EOF'
+echo run >> "$TEST_RESULTS/init-script"
+EOF
+start PGDATA="$work/fresh" TEST_BOOTSTRAP=1 POSTGRES_HOST_AUTH_METHOD=trust \
+  PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+test -f "$work/fresh/.psr-managed"
+test "$(stat -c %a "$work/fresh")" = 700
+test "$(grep -c '^initdb$' "$work/results/bootstrap")" = 1
+test "$(cat "$work/results/init-script")" = run
+start PGDATA="$work/fresh" TEST_BOOTSTRAP=1 POSTGRES_HOST_AUTH_METHOD=trust \
+  PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+test "$(grep -c '^initdb$' "$work/results/bootstrap")" = 1
+test "$(cat "$work/results/init-script")" = run
+tr '\0' '\n' < "$work/results/postgres.argv" | grep -qF ssl=on
+echo 'ok   fresh cluster initialises once and retains SSL defaults on restart'
+
+# Emulate kubelet's writable-directory mask on a later volume mount.
+chmod 2770 "$work/fresh"
+start PGDATA="$work/fresh" TEST_BOOTSTRAP=1 POSTGRES_HOST_AUTH_METHOD=trust \
+  PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+data_mode "$work/fresh" 700
+test "$(grep -c '^initdb$' "$work/results/bootstrap")" = 1
+test "$(cat "$work/results/init-script")" = run
+tr '\0' '\n' < "$work/results/postgres.argv" | grep -qF ssl=on
+echo 'ok   retained cluster repairs 2770 to 0700 without repeating initdb or scripts'
+
+boot TEST_SSL=off
+snapshot_files > "$work/before"
+owner="$(stat -c '%u %g' "$work/data")"
+for mode in 2770 750; do
+  chmod "$mode" "$work/data"
+  start TEST_SSL=off
+  data_mode "$work/data" 700
+  test "$(stat -c '%u %g' "$work/data")" = "$owner"
+  snapshot_files > "$work/after"
+  cmp "$work/before" "$work/after"
+  test ! -e "$work/data/.psr-managed"
+  if tr '\0' '\n' < "$work/results/postgres.argv" | grep -Eq 'ssl=|shared_preload_libraries=|max_worker_processes=|listen_addresses='; then exit 1; fi
+  echo "ok   imported cluster resets $mode to 0700; ownership, contents and settings retained"
+done
+
+# A real TLS key exposes the file-mode effect missed by directory-only checks.
+# The server is stubbed, so assert the unsupported case stays out of recipes.
+boot TEST_SSL=on PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+  -out "$work/data/server.crt" -keyout "$work/data/server.key" 2> "$work/tls.log"
+chmod 600 "$work/data/server.key"
+test "$(stat -c %a "$work/data/server.key")" = 600
+printf "ssl = on\nssl_key_file = 'server.key'\n" >> "$work/data/postgresql.conf"
+sha256sum "$work/data/server.key" > "$work/key-before"
+# Kubelet v1.35.0 ORs 0660 into files and 02770 into directories.
+find "$work/data" -type f -exec chmod ug+rw '{}' +
+find "$work/data" -type d -exec chmod ug+rwx,g+s '{}' +
+data_mode "$work/data" 2770
+start TEST_SSL=on PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+data_mode "$work/data" 700
+test "$(stat -c %a "$work/data/server.key")" = 660
+sha256sum "$work/data/server.key" > "$work/key-after"
+cmp "$work/key-before" "$work/key-after"
+# Inspect fenced YAML recipes, allowing warnings to quote the setting in prose.
+if awk '
+  /^[[:space:]]*(```+|~~~+)/ {
+    if (!fence) {
+      fence = substr($1, 1, 3)
+      yaml = ($1 ~ /^(```+|~~~+)(yaml|yml)$/)
+    } else if (substr($1, 1, 3) == fence && $1 ~ /^(```+|~~~+)$/) {
+      fence = ""
+      yaml = 0
+    }
+    next
+  }
+  yaml && /^[[:space:]]*fsGroup[[:space:]]*:/ { found = 1 }
+  yaml && /[{,][[:space:]]*fsGroup[[:space:]]*:/ { found = 1 }
+  END { exit !found }
+' "$repo/README.md"; then
+  echo 'FAIL README recommends fsGroup; imported TLS keys become 0660' >&2
+  exit 1
+fi
+# Require a warning about the key-mode problem without fixing its wording.
+awk '
+  BEGIN { RS = "" }
+  /fsGroup/ && /0660/ && /key/ {
+    if (tolower($0) ~ /(do not|never|avoid|unsupported)/) found = 1
+  }
+  END { exit !found }
+' "$repo/README.md"
+echo 'ok   imported TLS key stays 0660 after directory repair; README forbids fsGroup recipes'
 
 # Run the workflow's audit itself with failing and successful Nix queries.
 audit="$(sed -n '/^          closure=/,/^          if grep systemd/p' "$repo/.github/workflows/image.yml")"

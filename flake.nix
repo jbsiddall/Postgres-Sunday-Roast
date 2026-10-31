@@ -97,7 +97,7 @@
             "org.opencontainers.image.licenses" = "Apache-2.0";
           };
           Env = [
-            "PGDATA=/var/lib/postgresql/18/data"
+            "PGDATA=/var/lib/postgresql/18/docker"
             "LANG=en_US.UTF-8"
             "LOCALE_ARCHIVE=${locales}/lib/locale/locale-archive"
             "TZDIR=${pkgs.tzdata}/share/zoneinfo"

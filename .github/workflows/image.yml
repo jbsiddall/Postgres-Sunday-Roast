@@ -45,6 +45,8 @@ jobs:
             -e POSTGRES_PASSWORD=smoke-only-at-least-32-characters -e POSTGRES_DB=app -e PGWEB_ENABLED=1 \
             -v "$PWD/tests/initdb:/docker-entrypoint-initdb.d:ro" "postgres-sunday-roast:$VERSION"
           tests/smoke.sh smoke docker
+      - name: Official volume
+        run: tests/official-volume.sh "postgres-sunday-roast:$VERSION" docker
       - name: Service switches and PostgreSQL failure
         run: |
           wait_postgres() {
