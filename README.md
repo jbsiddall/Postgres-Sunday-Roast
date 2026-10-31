@@ -130,8 +130,8 @@ must use a password (SCRAM-SHA-256, unless `POSTGRES_HOST_AUTH_METHOD` says
 otherwise). New clusters have SSL on; to force it for TCP,
 change `host` to `hostssl` in `pg_hba.conf`.
 
-User: the server runs as uid and gid 999. If a volume was created for a
-different uid, `chown -R 999:999` it first.
+User: the server runs as uid and gid 999. Follow the
+[volume preparation procedure](#kubernetes) before attaching a volume.
 
 ## Services
 
@@ -288,13 +288,39 @@ volumes:
 
 For new and imported clusters, set `securityContext.runAsUser` and
 `runAsGroup` to 999, with `runAsNonRoot: true`, and mount the data volume at
-`/var/lib/postgresql`. Prepare its ownership once for 999:999 before starting:
-for a fresh volume, make the mounted directory writable by 999:999; for an
-import, preserve the cluster's restricted file modes while arranging ownership
-for that user. A PVC does not inherit the image directory's ownership. Check
-the mounted filesystem and prepare it through your storage provisioner or a
-separate maintenance step; provisioning defaults depend on the storage driver.
-The entrypoint never changes ownership.
+`/var/lib/postgresql`. A PVC does not inherit the image directory's ownership;
+the entrypoint never changes ownership. Prepare the volume once:
+
+1. With PostgreSQL stopped, mount the data PVC read-write at
+   `/var/lib/postgresql` in a one-off maintenance pod. Run its utility container
+   as UID/GID 0 (`runAsUser: 0`, `runAsGroup: 0`, `runAsNonRoot: false`),
+   without pod-wide `fsGroup`.
+2. For an **empty volume only**, change just the mount root:
+
+   ```sh
+   chown 999:999 /var/lib/postgresql
+   chmod u+rwx /var/lib/postgresql
+   ```
+
+   The database process creates its own restricted PGDATA beneath it. For an
+   imported official cluster already owned by 999:999, keep its ownership and
+   file modes; do not recursively chown it. For a different database UID, use a
+   maintenance container with GNU `find`, `stat` and `chown`. Read it with
+   `old_uid="$(stat -c %u /var/lib/postgresql/18/docker)"`, confirm it is the
+   expected nonzero database UID, then remap only that owner's files:
+
+   ```sh
+   find /var/lib/postgresql/18/docker -xdev -uid "$old_uid" -exec chown -h 999:999 '{}' +
+   ```
+
+   Ensure 999 can traverse `/var/lib/postgresql` and its `18` directory. Prepare
+   separately mounted WAL and tablespaces at their own mount paths. Preserve
+   root-owned TLS keys as root:999 with mode 0640; database-owned keys must stay
+   0600. Do not use recursive chmod or change root-owned 0640 keys to database
+   ownership without also restricting them to 0600.
+3. Remove the maintenance pod before starting PostgreSQL as 999:999. If policy
+   or the storage backend disallows these ownership changes, have the storage
+   administrator perform the same preparation before attaching the PVC.
 
 Do not set pod-wide `fsGroup`. Kubelet's recursive permission pass changes file
 modes inside supported volumes: a database-owned TLS key at 0600 becomes 0660,
@@ -327,14 +353,67 @@ For a supplied TLS pair, set `POSTGRES_SSL_CERT_FILE` and
 `POSTGRES_SSL_KEY_FILE` to the mounted paths. Prepare the key as owned by 999
 with mode 0600, or by root with mode 0640 and group 999, and ensure 999:999 can
 traverse its parent directories and read the certificate. A Kubernetes TLS
-Secret's `defaultMode: 0440` alone does not give its root-owned key group 999
-without `fsGroup`. Instead, arrange a separate prepared mount, for example by
-copying the Secret into a shared volume in an init container and setting the
-copy's ownership and mode before the database starts. Mount that prepared pair
-read-only in the database container and refresh the copy when rotating keys.
-Do not broaden the key's permissions to make it readable.
+Secret's `defaultMode` alone does not give its root-owned key group 999 without
+`fsGroup`. Merge this fragment into your database pod, keeping its prepared data
+volume, runtime mounts and password/service environment:
 
-Pin the image by digest
+```yaml
+spec:
+  securityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    runAsNonRoot: true
+  initContainers:
+    - name: prepare-tls
+      image: ghcr.io/jbsiddall/postgres-sunday-roast:18
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+          add: [CHOWN]
+      command: [/bin/bash, -euc]
+      args:
+        - |
+          umask 077
+          mkdir -p /tls-ready/pair
+          cp /tls-source/tls.crt /tls-ready/pair/server.crt
+          cp /tls-source/tls.key /tls-ready/pair/server.key
+          chmod 0700 /tls-ready/pair
+          chmod 0600 /tls-ready/pair/server.crt /tls-ready/pair/server.key
+          chown 999:999 /tls-ready/pair/server.crt /tls-ready/pair/server.key
+          chown 999:999 /tls-ready/pair
+      volumeMounts:
+        - { name: tls-source, mountPath: /tls-source, readOnly: true }
+        - { name: tls-ready, mountPath: /tls-ready }
+  containers:
+    - name: postgres
+      image: ghcr.io/jbsiddall/postgres-sunday-roast:18
+      env:
+        - { name: POSTGRES_SSL_CERT_FILE, value: /etc/postgres-tls/pair/server.crt }
+        - { name: POSTGRES_SSL_KEY_FILE, value: /etc/postgres-tls/pair/server.key }
+      volumeMounts:
+        - { name: tls-ready, mountPath: /etc/postgres-tls, readOnly: true }
+  volumes:
+    - name: tls-source
+      secret:
+        secretName: postgres-tls
+        defaultMode: 0400
+    - name: tls-ready
+      emptyDir: {}
+```
+
+UID 0 can read the root-owned 0400 Secret as its owner and write into the
+default 0777 `emptyDir` described above; only the ownership transfer needs
+`CHOWN`. The copy ends as 999:999 with a 0600 key in a 0700 directory. After
+updating the Secret, recreate the pod to rerun the init container for rotation.
+If policy disallows a root init container, use an administrator-prepared mount
+with the same final access. Do not broaden the key's permissions.
+
+Pin both image references by digest
 (`ghcr.io/jbsiddall/postgres-sunday-roast@sha256:...`); each CI run prints the
 digest in its summary.
 
@@ -389,10 +468,10 @@ This does not cover Alpine images, another architecture or another major version
      runAsNonRoot: true
    ```
 
-   Use the same [volume preparation as for new clusters](#kubernetes); do not
-   set `fsGroup`. Prepare ownership once for 999:999 without broadening key
-   permissions. The entrypoint resets only the PGDATA directory to 0700 when
-   owned by the current user, including a directory previously broadened to
+   Follow the imported-cluster branch of the
+   [volume preparation procedure](#kubernetes); do not set `fsGroup`. The
+   entrypoint resets only the PGDATA directory to 0700 when owned by the
+   current user, including a directory previously broadened to
    2770. The
    [official entrypoint at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh#L39-L41)
    does the same, including resetting mode 0750 to 0700. Group access through

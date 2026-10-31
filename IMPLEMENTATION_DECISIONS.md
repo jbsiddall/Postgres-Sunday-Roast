@@ -67,8 +67,11 @@ key changed from 0600 to 0660 and prevents PostgreSQL starting; repairing keys
 at startup, which changes user files; and relying on `OnRootMismatch`, which
 can still recurse when the volume root does not match. Also rejected:
 preserving 0750 separately from upstream's directory policy. Cost: deployments
-must prepare volume ownership and supplied TLS key access separately; direct
-TLS Secret mounts cannot rely on `fsGroup` to grant group access. Existing
+must use the documented stopped-database root maintenance procedure (or storage
+administrator) for volume ownership. TLS Secrets need the documented root init
+container to copy into an `emptyDir`, or an administrator-prepared mount;
+rotation requires recreating the pod to refresh that copy. Direct Secret mounts
+cannot rely on `fsGroup` to grant group access. Existing
 0750 clusters lose group access through PGDATA on restart; contained files
 keep their modes.
 Evidence, checked 2026-10-31: kubelet v1.35.0's

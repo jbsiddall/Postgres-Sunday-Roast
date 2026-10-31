@@ -321,13 +321,33 @@ data_mode "$work/data" 700
 test "$(stat -c %a "$work/data/server.key")" = 660
 sha256sum "$work/data/server.key" > "$work/key-after"
 cmp "$work/key-before" "$work/key-after"
-if grep -Eq 'fsGroup[[:space:]]*:' "$repo/README.md"; then
+# Inspect fenced YAML recipes, allowing warnings to quote the setting in prose.
+if awk '
+  /^[[:space:]]*(```+|~~~+)/ {
+    if (!fence) {
+      fence = substr($1, 1, 3)
+      yaml = ($1 ~ /^(```+|~~~+)(yaml|yml)$/)
+    } else if (substr($1, 1, 3) == fence && $1 ~ /^(```+|~~~+)$/) {
+      fence = ""
+      yaml = 0
+    }
+    next
+  }
+  yaml && /^[[:space:]]*fsGroup[[:space:]]*:/ { found = 1 }
+  yaml && /[{,][[:space:]]*fsGroup[[:space:]]*:/ { found = 1 }
+  END { exit !found }
+' "$repo/README.md"; then
   echo 'FAIL README recommends fsGroup; imported TLS keys become 0660' >&2
   exit 1
 fi
-# Match literal Markdown backticks.
-# shellcheck disable=SC2016
-grep -qF 'SSL keys on data volumes changed by `fsGroup` are unsupported.' "$repo/README.md"
+# Require a warning about the key-mode problem without fixing its wording.
+awk '
+  BEGIN { RS = "" }
+  /fsGroup/ && /0660/ && /key/ {
+    if (tolower($0) ~ /(do not|never|avoid|unsupported)/) found = 1
+  }
+  END { exit !found }
+' "$repo/README.md"
 echo 'ok   imported TLS key stays 0660 after directory repair; README forbids fsGroup recipes'
 
 # Run the workflow's audit itself with failing and successful Nix queries.
