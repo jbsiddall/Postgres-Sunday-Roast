@@ -3,7 +3,7 @@
 PostgreSQL 18 with all the trimmings: one container image with 92 extensions
 ready to `CREATE EXTENSION`. It includes vectors, geospatial, DuckDB analytics,
 cron jobs, incremental views, queues, GraphQL, and Python and JavaScript
-functions, with SSL on from the first start.
+functions, with SSL on for new clusters.
 
 It is built with [Nix](https://nixos.org) from a pinned nixpkgs, so every build
 uses the same inputs. It runs as a non-root user and follows the official
@@ -44,7 +44,8 @@ modules that are loaded rather than created: `safeupdate` (blocks `UPDATE` and
 `auto_explain`. To see the full list with versions, run
 `select name, default_version from pg_available_extensions order by 1`.
 
-`pg_stat_statements`, `pg_cron`, `pg_ivm` and `pg_duckdb` are preloaded.
+For clusters created by this image, `pg_stat_statements`, `pg_cron`, `pg_ivm`
+and `pg_duckdb` are preloaded.
 `pg_cron` lives in the `postgres` database, and its jobs run in background
 workers, so they need no password.
 
@@ -61,12 +62,12 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 | `POSTGRES_PASSWORD` | required on first start | Password of `POSTGRES_USER`. Optional for an existing cluster or with `POSTGRES_HOST_AUTH_METHOD=trust`. |
 | `POSTGRES_USER` | `postgres` | Superuser created on first start. |
 | `POSTGRES_DB` | `$POSTGRES_USER` | Database created on first start. |
-| `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--data-checksums`. |
+| `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--no-data-checksums` (18 enables checksums by default). |
 | `POSTGRES_INITDB_WALDIR` | inside `PGDATA` | Put the write-ahead log in another directory, e.g. a faster volume. |
 | `LANG` | `en_US.UTF-8` | Locale of a new cluster. `C.UTF-8` is the only other locale in the image. |
 | `POSTGRES_HOST_AUTH_METHOD` | `scram-sha-256` | Authentication for TCP connections. `trust` needs no password from anyone who can reach the port, so use it only for throwaway local databases. |
-| `PGDATA` | `/var/lib/postgresql/18/data` | Data directory. Mount a volume at `/var/lib/postgresql`. |
-| `POSTGRES_SSL_CERT_FILE`, `POSTGRES_SSL_KEY_FILE` | self-signed in `$PGDATA` | Use your own certificate, e.g. from a Kubernetes secret. |
+| `PGDATA` | `/var/lib/postgresql/18/docker` | Data directory. Mount a volume at `/var/lib/postgresql`. |
+| `POSTGRES_SSL_CERT_FILE`, `POSTGRES_SSL_KEY_FILE` | self-signed under `/run/psr-services` for new clusters | Use your own certificate, e.g. from a Kubernetes secret. |
 | `POSTGRES_SSL_CN` | `postgres` | Common name of the generated certificate. |
 | `POSTGRES_SHARED_PRELOAD_LIBRARIES` | `pg_stat_statements,pg_cron,pg_ivm,pg_duckdb` | Change what is preloaded. |
 | `POSTGRES_CRON_DATABASE` | `postgres` | Database that holds `pg_cron`'s tables. |
@@ -124,9 +125,9 @@ PostgreSQL `SIGINT` for a fast shutdown, disconnecting busy clients cleanly.
 If PostgreSQL exits unexpectedly, the container exits too; s6 restarts the
 other services if they fail. Service output goes to the container log.
 
-Authentication: local socket connections are trusted, and every TCP connection
+Authentication on new clusters: local socket connections are trusted, and every TCP connection
 must use a password (SCRAM-SHA-256, unless `POSTGRES_HOST_AUTH_METHOD` says
-otherwise). SSL is always on; to force it for TCP,
+otherwise). New clusters have SSL on; to force it for TCP,
 change `host` to `hostssl` in `pg_hba.conf`.
 
 User: the server runs as uid and gid 999. If a volume was created for a
@@ -337,18 +338,161 @@ dependencies never end up in it. PgBouncer is built without systemd and
 PostgREST uses its binary output to keep the runtime closure small. The biggest
 parts are Python (for PL/Python), DuckDB, GDAL and PROJ (for PostGIS) and ICU.
 
-## Upgrading from the official image
+## Switching from the official image
 
-The data format is the same PostgreSQL 18 format, but the official Debian
-image and this one link against different glibc versions. Text indexes can
-sort differently between glibc versions, so don't point this image at an
-existing data directory. Instead, dump and restore, which rebuilds the indexes:
+Mount an official PostgreSQL 18 volume at `/var/lib/postgresql` without a
+`PGDATA` override. Both images use `/var/lib/postgresql/18/docker` and the
+Debian official image's `postgres` user is 999:999. Verified on 2026-10-31
+against [Dockerfile commit e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/Dockerfile).
+This does not cover Alpine images, another architecture or another major version.
 
-```sh
-docker exec old-pg pg_dumpall -U postgres > dump.sql
-docker run -d --name pg -e POSTGRES_PASSWORD=... -v newdata:/var/lib/postgresql ghcr.io/jbsiddall/postgres-sunday-roast:18
-docker exec -i pg psql -U postgres -h /run/postgresql < dump.sql
-```
+1. Back up first and test restoring the backup. Record the old image digest,
+   PostgreSQL version, `SHOW data_checksums`, database locales and installed
+   extensions (`SELECT extname, extversion FROM pg_extension` in each database).
+   Stop application traffic, then stop the old container cleanly. Keep a stopped
+   copy or snapshot of the volume; never run both servers against it. Dump and
+   restore into a new volume remains an alternative that rebuilds indexes.
+2. Check the stopped cluster with `pg_controldata -D /var/lib/postgresql/18/docker`
+   using a one-off container and the same volume. Keep PostgreSQL major version
+   18 and architecture unchanged. Preserve mounts for external WAL, tablespaces,
+   certificates and included configuration, at their original paths. Confirm
+   the target has the locales and extension libraries the cluster uses; this
+   image contains only `en_US.UTF-8` and `C.UTF-8` glibc locales.
+3. Mount the same volume and run as 999:999. For Kubernetes, use this pod
+   security context (the volume must already have the right owner):
+
+   ```yaml
+   securityContext:
+     runAsUser: 999
+     runAsGroup: 999
+     runAsNonRoot: true
+     fsGroup: 999
+     fsGroupChangePolicy: OnRootMismatch
+   ```
+
+   PostgreSQL requires the data directory to be owned by the server user with
+   mode 0700 or 0750. Check after your storage driver's ownership handling;
+   `fsGroup` can broaden permissions. Arrange the correct ownership and mode
+   before starting; this entrypoint does not chown or chmod an existing cluster.
+   See [Kubernetes volume ownership](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#configure-volume-permission-and-ownership-change-policy-for-pods).
+   With a read-only root filesystem, also supply writable volumes at
+   `/run/postgresql`, `/run/psr-services` and `/tmp`, as above.
+   For example, with Docker:
+
+   ```sh
+   docker run -d --name pg --user 999:999 \
+     -e PGBOUNCER_ENABLED=false -e POSTGREST_ENABLED=false \
+     -v pgdata:/var/lib/postgresql ghcr.io/jbsiddall/postgres-sunday-roast:18
+   ```
+
+4. Before reopening traffic, inspect logs and connect to every application
+   database. Confirm your rows, checksums, authentication, SSL, extensions and
+   settings. The entrypoint skips initdb and init scripts, leaves `pg_hba.conf`,
+   configuration and certificates alone, and preserves existing server settings.
+   It supplies `unix_socket_directories=/run/postgresql` for bundled services;
+   command arguments still win. It does not replace an imported preload list,
+   worker limits, listen addresses or SSL policy. Explicit SSL/preload/cron
+   environment variables still override their settings. Enable bundled services
+   only after checking their trusted-socket and role requirements above.
+   Set `POSTGRES_USER` and `POSTGRES_DB` to existing roles and databases;
+   setting `POSTGRES_PASSWORD` does not reset an existing role's password.
+   PgBouncer generates its own runtime certificate when PostgreSQL has SSL off.
+5. Resolve collation changes before serving queries. The pinned official
+   `postgres:18` (18.6, trixie) contains Debian glibc 2.41
+   (`libc6 2.41-12+deb13u4`); this flake's nixpkgs pin contains glibc 2.44.
+   Sources: [Debian libc6](https://packages.debian.org/trixie/libc6),
+   [pinned Nix definition](https://github.com/NixOS/nixpkgs/blob/1c89083e451e891152365b799595cf7790a43325/pkgs/development/libraries/glibc/common.nix).
+   Check your actual old digest; older Debian tags can differ. A "collation
+   version mismatch" warning means the recorded version differs from the
+   current provider. It does not block startup or rebuild anything. B-tree
+   indexes on `text`/`varchar` (including primary keys), expression indexes
+   and other objects that depend on changed libc or ICU collations can retain
+   an obsolete order. Index scans may return wrong results without an error;
+   an absence of warnings does not prove the sort rules are unchanged.
+   [Binary `C`/`POSIX` collations](https://www.postgresql.org/docs/18/collation.html)
+   do not use language-specific sort rules.
+   See [PostgreSQL's collation guidance](https://www.postgresql.org/docs/18/sql-altercollation.html).
+
+   Connect as a superuser to each affected database, including `postgres`
+   and any template database with affected objects. Rebuild affected indexes
+   first; rebuilding all user indexes in the database is a conservative option:
+
+   ```sql
+   -- Connected to app, with application traffic stopped.
+   REINDEX DATABASE app;
+   ALTER DATABASE app REFRESH COLLATION VERSION;
+   ```
+
+   `REINDEX DATABASE` runs outside a transaction. Resolve any duplicate-key
+   errors and rebuild other collation-dependent objects before refreshing.
+   It excludes system catalogs; use `REINDEX SYSTEM app` if their indexes
+   are affected too. See [REINDEX](https://www.postgresql.org/docs/18/sql-reindex.html).
+   For explicitly named collations, also rebuild their dependent objects and
+   then run `ALTER COLLATION schema.collation_name REFRESH VERSION` in that
+   database. List mismatches with:
+
+   ```sql
+   SELECT datname, datcollversion, pg_database_collation_actual_version(oid)
+   FROM pg_database
+   WHERE datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid);
+
+   SELECT oid::regcollation, collversion, pg_collation_actual_version(oid)
+   FROM pg_collation
+   WHERE collversion IS DISTINCT FROM pg_collation_actual_version(oid);
+   ```
+
+   Refreshing version metadata alone only silences the warning. It does not
+   repair indexes. See [ALTER DATABASE](https://www.postgresql.org/docs/18/sql-alterdatabase.html).
+6. Compare extensions in every database with `pg_available_extension_versions`.
+   A missing `shared_preload_libraries` entry prevents startup; other missing
+   libraries can fail when a function is first used. Restore compatible
+   libraries or rebuild the image. Where supported by the extension's upgrade
+   path, run `ALTER EXTENSION extension_name UPDATE` (or `UPDATE TO 'version'`)
+   in each database, then test its functions. Changing images does not update
+   extension SQL objects automatically. Do not assume an older bundled version
+   can read a newer extension's data. See [ALTER EXTENSION](https://www.postgresql.org/docs/18/sql-alterextension.html)
+   and [shared library preloading](https://www.postgresql.org/docs/18/runtime-config-client.html#RUNTIME-CONFIG-CLIENT-PRELOAD).
+
+### Binary compatibility and checksums
+
+PostgreSQL checks `PG_VERSION` and `pg_control` at startup. A different major
+version, control/catalog format, data or WAL block size, alignment, floating-point
+format, or float8/int8 pass-by-value ABI fails loudly. PostgreSQL 18 always uses
+integer timestamps; the old integer-versus-float timestamp build option is not
+an 18 setting. A valid WAL segment size is read from the cluster (powers of two
+from 1 MB to 1 GB); it need not equal initdb's default of 16 MB. Invalid sizes
+fail at startup. These checks do not detect collation ordering problems.
+Sources: [18.6 control checks](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/access/transam/xlog.c),
+[major-version check](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/init/miscinit.c),
+[control fields](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_control.h),
+[timestamp types](https://github.com/postgres/postgres/blob/REL_18_6/src/include/datatype/timestamp.h).
+
+PostgreSQL 18 initdb enables data checksums by default. The official entrypoint
+passes the username and password file, optional `--waldir`, and user-supplied
+`POSTGRES_INITDB_ARGS`; it does not disable checksums by default. Reusing a
+cluster preserves its checksum setting, including an explicit
+`--no-data-checksums`. Check `SHOW data_checksums` after startup; optionally
+run `pg_checksums --check` on a cleanly stopped checksummed cluster.
+Sources: [initdb](https://www.postgresql.org/docs/18/app-initdb.html),
+[official entrypoint at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/docker-entrypoint.sh),
+[pg_checksums](https://www.postgresql.org/docs/18/app-pgchecksums.html),
+[pg_controldata](https://www.postgresql.org/docs/18/app-pgcontroldata.html).
+
+### Existing PSR volumes
+
+Earlier builds used `/var/lib/postgresql/18/data`. Keep that volume and set
+`PGDATA=/var/lib/postgresql/18/data`. If the new default has no cluster and
+that old path has `PG_VERSION`, startup refuses to initialise a new database
+and prints this override. No migration, move, deletion or symlink is performed.
+
+Clusters created by this build have a `.psr-managed` marker so the image's
+SSL, preload and worker defaults also apply on restart. Imported clusters,
+including older PSR clusters without the marker, keep their stored settings.
+For older PSR clusters that relied on command-line defaults, explicitly set
+`POSTGRES_SHARED_PRELOAD_LIBRARIES`, SSL certificate/key variables and other
+needed server arguments when recreating the container. Generated certificates
+now live in unique directories under `/run/psr-services`; they are regenerated
+on restart. Mount your own pair for stable certificate identity.
 
 ## Build it yourself
 
@@ -378,6 +522,17 @@ preloaded libraries, init scripts and `pg_cron`, then creates every available
 extension. CI also checks service
 switches and shutdown, runs on every pull request and pushes the image to GHCR
 from `main`.
+
+The volume reuse test creates a disposable volume using a digest-pinned
+`postgres:18`, stops it cleanly, and checks its rows, cluster identity,
+checksums and configuration in this image without a `PGDATA` override.
+It prints `collation-version-warning: yes` or `no` without failing on the
+warning, and removes the containers and volume even on failure:
+
+```sh
+tests/official-volume.sh postgres-sunday-roast:18.6 podman
+# Or: tests/official-volume.sh postgres-sunday-roast:18.6 docker
+```
 
 ## Not included
 

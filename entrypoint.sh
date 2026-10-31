@@ -2,8 +2,8 @@
 #
 # On an empty PGDATA it initialises a cluster, creates POSTGRES_DB and runs any
 # /docker-entrypoint-initdb.d/*.sql, *.sql.gz and *.sh once, like the official
-# postgres image. It then starts PostgreSQL with SSL on, generating a
-# self-signed certificate unless one is supplied. Extra arguments are passed to
+# postgres image. New clusters use SSL with a self-signed certificate unless
+# one is supplied; existing clusters keep their configuration. Arguments go to
 # postgres after the defaults below, so `-c work_mem=64MB` style flags win.
 # A command that is not postgres, such as `psql` or `bash`, runs as given.
 
@@ -18,6 +18,13 @@ esac
 
 : "${PGDATA:?PGDATA must be set}"
 initdb_dir=/docker-entrypoint-initdb.d
+
+# Do not hide an earlier volume behind a newly initialised cluster.
+if [ "$PGDATA" = /var/lib/postgresql/18/docker ] &&
+  [ ! -s "$PGDATA/PG_VERSION" ] && [ -e /var/lib/postgresql/18/data/PG_VERSION ]; then
+  echo "Existing PSR cluster found at /var/lib/postgresql/18/data; refusing to initialise $PGDATA. Set PGDATA=/var/lib/postgresql/18/data to use it. No data has been moved or deleted." >&2
+  exit 1
+fi
 
 enabled() {
   case "${1,,}" in
@@ -74,27 +81,56 @@ if enabled "${PGWEB_ENABLED-false}"; then
 fi
 
 umask 077
-mkdir -p "$PGDATA"
-chmod 700 "$PGDATA"
+runtime=/run/psr-services
+mkdir -p "$runtime"
+fresh=
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+  fresh=1
+  mkdir -p "$PGDATA"
+  chmod 700 "$PGDATA"
+fi
+managed="$fresh"
+if [ -f "$PGDATA/.psr-managed" ]; then managed=1; fi
 
+generate_tls() {
+  local dir
+  # A unique runtime path cannot overwrite a cluster's certificates.
+  dir="$(mktemp -d "$runtime/tls.XXXXXX")"
+  cert="$dir/server.crt"
+  key="$dir/server.key"
+  openssl req -new -x509 -days 3650 -nodes -subj "/CN=${POSTGRES_SSL_CN:-postgres}" \
+    -out "$cert" -keyout "$key" 2> /dev/null
+  echo "Generated a self-signed certificate at $cert"
+}
+
+settings=()
 if [ -n "${POSTGRES_SSL_CERT_FILE:-}" ]; then
   cert="$POSTGRES_SSL_CERT_FILE"
   key="${POSTGRES_SSL_KEY_FILE:?POSTGRES_SSL_KEY_FILE must be set with POSTGRES_SSL_CERT_FILE}"
-else
-  cert="$PGDATA/server.crt"
-  key="$PGDATA/server.key"
+  settings+=(-c ssl=on -c ssl_cert_file="$cert" -c ssl_key_file="$key")
+elif [ -n "$managed" ]; then
+  generate_tls
+  settings+=(-c ssl=on -c ssl_cert_file="$cert" -c ssl_key_file="$key")
 fi
 
-settings=(
-  -c ssl=on -c ssl_cert_file="$cert" -c ssl_key_file="$key"
-  -c shared_preload_libraries="${POSTGRES_SHARED_PRELOAD_LIBRARIES:-pg_stat_statements,pg_cron,pg_ivm,pg_duckdb}"
-  -c cron.database_name="${POSTGRES_CRON_DATABASE:-postgres}" -c cron.use_background_workers=on
-  -c max_worker_processes=16
-  -c duckdb.max_memory=256MB
-)
+if [ -n "$managed" ]; then
+  settings+=(
+    -c shared_preload_libraries="${POSTGRES_SHARED_PRELOAD_LIBRARIES:-pg_stat_statements,pg_cron,pg_ivm,pg_duckdb}"
+    -c cron.database_name="${POSTGRES_CRON_DATABASE:-postgres}" -c cron.use_background_workers=on
+    -c max_worker_processes=16
+    -c duckdb.max_memory=256MB
+    -c listen_addresses='*'
+  )
+else
+  if [[ -v POSTGRES_SHARED_PRELOAD_LIBRARIES ]]; then
+    settings+=(-c shared_preload_libraries="$POSTGRES_SHARED_PRELOAD_LIBRARIES")
+  fi
+  if [[ -v POSTGRES_CRON_DATABASE ]]; then
+    settings+=(-c cron.database_name="$POSTGRES_CRON_DATABASE")
+  fi
+fi
 
-fresh=
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
+if [ -n "$fresh" ]; then
   # No --locale: initdb takes LANG, which the image sets to en_US.UTF-8.
   initdb_args=(-D "$PGDATA" -U "$POSTGRES_USER" --encoding=UTF8
     --auth-local=trust --auth-host="$auth")
@@ -117,13 +153,8 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
   initdb "${initdb_args[@]}" ${POSTGRES_INITDB_ARGS:-}
   if [ -n "${pwfile:-}" ]; then rm -f "$pwfile"; fi
   echo "host all all all $auth" >> "$PGDATA/pg_hba.conf"
-  fresh=1
-fi
-
-if [ ! -s "$key" ]; then
-  openssl req -new -x509 -days 3650 -nodes -subj "/CN=${POSTGRES_SSL_CN:-postgres}" \
-    -out "$cert" -keyout "$key" 2> /dev/null
-  echo "Generated a self-signed certificate at $cert"
+  # Retain these defaults on restarts without changing imported clusters.
+  touch "$PGDATA/.psr-managed"
 fi
 
 # A function, so a sourced script's `set --` cannot replace the server's
@@ -175,8 +206,8 @@ if [ -n "$fresh" ]; then
   if [ -n "$set_pgpassword" ]; then unset PGPASSWORD; fi
 fi
 
-# Keep the final server's arguments intact, including overrides from the caller.
-server=(postgres -D "$PGDATA" "${settings[@]}" -c listen_addresses='*' "$@")
+# Bundled services connect through this socket; caller arguments still win.
+server=(postgres -D "$PGDATA" "${settings[@]}" -c unix_socket_directories=/run/postgresql "$@")
 pg_port="$("${server[@]}" -C port)"
 cert="$("${server[@]}" -C ssl_cert_file)"
 key="$("${server[@]}" -C ssl_key_file)"
@@ -185,7 +216,6 @@ key="$("${server[@]}" -C ssl_key_file)"
 [[ "$key" = /* ]] || key="$PGDATA/$key"
 
 # This directory must permit execution: s6 executes its generated scripts.
-runtime=/run/psr-services
 services="$runtime/services"
 mkdir -p "$runtime"
 rm -rf "$services"
@@ -252,6 +282,9 @@ EOF
 chmod 700 "$services/postgres/finish" "$services/.s6-svscan/SIGTERM" "$services/.s6-svscan/finish"
 
 if enabled "${PGBOUNCER_ENABLED-true}"; then
+  if [ "$("${server[@]}" -C ssl)" = off ]; then
+    generate_tls
+  fi
   case "$auth" in
     scram-sha-256 | md5 | trust) ;;
     *) echo "PgBouncer supports POSTGRES_HOST_AUTH_METHOD=scram-sha-256, md5 or trust; disable it for other methods" >&2; exit 1 ;;

@@ -42,13 +42,46 @@ cache, so CI compiles it. Check: the smoke test's
 
 ## Data directory and user
 
-`PGDATA` defaults to `/var/lib/postgresql/18/data` and the server runs as
-999:999, matching the official image's uid. The self-signed certificate lives
-inside `PGDATA` so a single volume holds all state. Rejected: running as root
-and dropping privileges in the entrypoint, which needs `gosu` and breaks
-`runAsNonRoot` in Kubernetes. Cost: a volume created for another uid must be
-chowned first. Check: `docker run --rm --entrypoint id ghcr.io/jbsiddall/postgres-sunday-roast:18`
-prints `uid=999(postgres)`.
+Choice: default `PGDATA` to `/var/lib/postgresql/18/docker`, keep it
+overridable, declare the volume at `/var/lib/postgresql` and run as 999:999.
+This matches the official Debian PostgreSQL 18 image so its volume can be
+mounted unchanged. Rejected: keeping `18/data`, which initialises an empty
+cluster beside an official cluster and looks like data loss. Also rejected:
+migrating or symlinking directories at startup, which changes existing volume
+state and obscures which path is in use. Cost: this breaks the default path
+for volumes created by earlier PSR builds. Set
+`PGDATA=/var/lib/postgresql/18/data` for those volumes. If the new default
+has no cluster and the old path has `PG_VERSION`, refuse initdb and print
+that override; never move or delete data. A volume for another uid needs
+ownership corrected before startup; running as root and dropping privileges
+would break `runAsNonRoot` and require another helper.
+
+Imported clusters retain their files, directory mode, authentication and
+server settings. Only the socket path is supplied for bundled services;
+explicit environment and command-line overrides still apply. Fresh clusters
+get a `.psr-managed` marker to retain this image's defaults on restart.
+Rejected: imposing preloads, SSL and worker limits on imported clusters, or
+writing generated certificates to `PGDATA/server.crt` and `server.key`,
+which can overwrite user files. Generate self-signed pairs in unique runtime
+directories under `/run/psr-services` instead. Cost: generated certificate
+identity changes on restart; mount a supplied pair for a stable identity.
+Imported clusters can keep SSL off, and bundled services may require explicit
+authentication and role configuration. Older PSR clusters lack the marker;
+reapply any previous command-line defaults explicitly. No automatic SQL,
+collation refresh, reindexing or extension upgrades are performed.
+
+Evidence, checked 2026-10-31: official
+[Dockerfile e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/Dockerfile)
+sets that PGDATA and volume and creates uid/gid 999. The pinned
+`postgres:18` digest in `tests/official-volume.sh` is PostgreSQL 18.6 on
+Debian trixie with glibc 2.41; nixpkgs 1c89083e here has
+[glibc 2.44](https://github.com/NixOS/nixpkgs/blob/1c89083e451e891152365b799595cf7790a43325/pkgs/development/libraries/glibc/common.nix).
+The [collation guidance](https://www.postgresql.org/docs/18/sql-altercollation.html)
+requires rebuilding affected objects before refreshing versions. The README
+records binary checks, checksums, extension checks and the switch procedure.
+Check: `tests/entrypoint.sh` covers legacy-volume refusal, the override,
+imported-file preservation and managed restarts; `tests/official-volume.sh`
+checks a real official-image volume in CI.
 
 ## s6 supervises the bundled services
 
