@@ -27,7 +27,10 @@ jobs:
       - name: Build
         run: |
           # Run the harness with the bash writeShellApplication gives the entrypoint.
-          ENTRYPOINT_BASH="$(nix build --no-link --print-out-paths --inputs-from . "nixpkgs#runtimeShellPackage^out")/bin/bash" bash tests/entrypoint.sh
+          # A separate assignment, so a failed build stops the step.
+          runtime_shell="$(nix build --no-link --print-out-paths --inputs-from . "nixpkgs#runtimeShellPackage^out")"
+          test -x "$runtime_shell/bin/bash"
+          ENTRYPOINT_BASH="$runtime_shell/bin/bash" bash tests/entrypoint.sh
           nix build .#default -o image.tar.gz -L
           echo "VERSION=$(nix eval --raw .#default.imageTag)" >> "$GITHUB_ENV"
           # PostgreSQL already links systemd-minimal-libs; the services must add none.
