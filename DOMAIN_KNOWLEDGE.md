@@ -51,6 +51,31 @@ local run without a database, 2026-10-31. See
 [request ordering](https://github.com/PostgREST/postgrest/blob/v14.16/src/PostgREST/App.hs#L121-L170)
 and [error statuses](https://github.com/PostgREST/postgrest/blob/v14.16/src/PostgREST/Error.hs#L693-L739).
 
+## Kubernetes
+
+### fsGroup can invalidate imported PostgreSQL directory permissions
+
+Read on 2026-10-31: kubelet v1.35.0's
+[volume ownership handling](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/volume_linux.go)
+treats a volume root without setgid as an `OnRootMismatch`, even when its
+group already matches `fsGroup`. For a writable volume, recursion ORs group
+rwx and setgid into every directory, changing PGDATA mode 0700 or 0750 to
+2770. The official PostgreSQL 18
+[Dockerfile at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/Dockerfile)
+creates `/var/lib/postgresql` as 1777, without setgid. The 2026-10-31 review
+reproduced PostgreSQL 18.6 refusing mode 2770 with "invalid permissions" and
+requiring 0700 or 0750; this was a local permission reproduction, not a
+Kubernetes deployment test. Omit `fsGroup` for an imported volume that
+already belongs to 999:999; this entrypoint preserves existing PGDATA modes.
+
+The v1.35.0
+[emptyDir implementation](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go)
+creates default volumes with mode 0777 and corrects restrictive umasks with
+chmod. Thus default `emptyDir: {}` mounts at `/run/postgresql`,
+`/run/psr-services` and `/tmp` remain writable as 999:999 without `fsGroup`,
+including with a read-only container root. This is a source observation,
+checked on 2026-10-31.
+
 ## PostgreSQL
 
 ### Official PostgreSQL 18 image layout and initdb

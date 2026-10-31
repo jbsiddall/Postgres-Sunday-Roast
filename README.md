@@ -286,14 +286,18 @@ volumes:
 
 ### Kubernetes
 
-Set `securityContext.runAsUser`, `runAsGroup` and `fsGroup` to 999 and mount
-the volume at `/var/lib/postgresql`. `runAsNonRoot: true` is supported. With
-`readOnlyRootFilesystem: true`, also mount writable `emptyDir` volumes at
+For new clusters, set `securityContext.runAsUser`, `runAsGroup` and `fsGroup`
+to 999 and mount the volume at `/var/lib/postgresql`. `runAsNonRoot: true` is
+supported. With `readOnlyRootFilesystem: true`, also mount writable `emptyDir`
+volumes at
 `/run/postgresql`, `/run/psr-services` (s6 state and generated configuration)
-and `/tmp`, owned by uid 999 or writable through `fsGroup: 999`.
+and `/tmp`.
 Kubernetes `emptyDir` volumes permit execution by default; no Docker-style
 `exec` option is needed. A cluster policy or mount override must not make
 `/run/psr-services` `noexec`.
+
+Do not use `fsGroup` on an imported volume; follow
+[Switching from the official image](#switching-from-the-official-image).
 
 PostgreSQL refuses a private key that others can read. To use a certificate
 from a TLS Secret, mount it with `defaultMode: 0440`. The files are then owned
@@ -359,24 +363,26 @@ This does not cover Alpine images, another architecture or another major version
    the target has the locales and extension libraries the cluster uses; this
    image contains only `en_US.UTF-8` and `C.UTF-8` glibc locales.
 3. Mount the same volume and run as 999:999. For Kubernetes, use this pod
-   security context (the volume must already have the right owner):
+   security context (the volume must already belong to 999:999):
 
    ```yaml
    securityContext:
      runAsUser: 999
      runAsGroup: 999
      runAsNonRoot: true
-     fsGroup: 999
-     fsGroupChangePolicy: OnRootMismatch
    ```
 
+   `fsGroup` is omitted because kubelet can recursively broaden an imported
+   data directory's permissions to 2770, which PostgreSQL rejects.
    PostgreSQL requires the data directory to be owned by the server user with
-   mode 0700 or 0750. Check after your storage driver's ownership handling;
-   `fsGroup` can broaden permissions. Arrange the correct ownership and mode
+   mode 0700 or 0750. Arrange the correct ownership and mode
    before starting; this entrypoint does not chown or chmod an existing cluster.
    See [Kubernetes volume ownership](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#configure-volume-permission-and-ownership-change-policy-for-pods).
-   With a read-only root filesystem, also supply writable volumes at
-   `/run/postgresql`, `/run/psr-services` and `/tmp`, as above.
+   With a read-only root filesystem, mount default `emptyDir: {}` volumes at
+   `/run/postgresql`, `/run/psr-services` and `/tmp`; Kubernetes v1.35.0
+   [creates them with mode 0777](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go),
+   so all three paths are writable as 999:999 without `fsGroup`.
+   Keep `/run/psr-services` executable, as above.
    For example, with Docker:
 
    ```sh
