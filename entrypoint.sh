@@ -196,7 +196,10 @@ service() {
   mkdir -p "$services/$name"
   # Secrets belong to their consumer, never the supervisor or command line.
   {
-    for var in $(compgen -e); do
+    # Every routed variable starts with PG. compgen would list exports, but the
+    # image runs this script with a bash built without it, which fails silently.
+    for var in ${!PG@}; do
+      [[ "$(declare -p "$var")" == "declare -"*x* ]] || continue
       case "$name:$var" in
         postgres:PGRST_* | postgres:PGWEB_* | postgres:PGBOUNCER_*) continue ;;
         postgres:PG* | postgrest:PGRST_* | pgweb:PGWEB_AUTH_USER | pgweb:PGWEB_AUTH_PASS)

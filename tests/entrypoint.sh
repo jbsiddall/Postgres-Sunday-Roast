@@ -44,7 +44,7 @@ boot() {
   printf 'stub\n' > "$work/data/server.key"
   env -i PATH="$work/bin:$PATH" PGDATA="$work/data" TEST_DATA="$work/data" \
     TEST_RESULTS="$work/results" SSL_CERT_FILE=/unused "$@" \
-    bash -euo pipefail "$work/entrypoint.sh" > "$work/stdout" 2> "$work/stderr"
+    "${ENTRYPOINT_BASH:-bash}" -euo pipefail "$work/entrypoint.sh" > "$work/stdout" 2> "$work/stderr"
 }
 has() {
   local entry
