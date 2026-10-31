@@ -55,7 +55,7 @@ http_status() {
     if [ -n "${2:-}" ]; then printf "Authorization: %s\r\n" "$2" >&3; fi
     printf "\r\n" >&3
     read -r -t 5 status <&3
-    printf "%s\n" "$status"
+    printf "%s\n" "$status" | tr -d "\r"
   ' bash "$1" "${2:-}" 2> /dev/null
 }
 pgrst_port="$("$engine" exec "$container" bash -c 'printf "%s" "${PGRST_SERVER_PORT:-3000}"')"
@@ -79,7 +79,8 @@ if "$engine" exec "$container" bash -c 'command -v openssl' > /dev/null; then
     b64url() { openssl base64 -A | tr "+/" "-_" | tr -d "="; }
     header=$(printf %s '\''{"alg":"HS256","typ":"JWT"}'\'' | b64url)
     # Smoke fixtures use the default postgres superuser.
-    payload=$(printf '\''{"role":"postgres","exp":%s}'\'' "$(( $(date +%s) + 60 ))" | b64url)
+    # Outlive the retry budget, including five-second HTTP reads.
+    payload=$(printf '\''{"role":"postgres","exp":%s}'\'' "$(( $(date +%s) + 600 ))" | b64url)
     input=$header.$payload
     # Build HMAC pads in bash so even the test keeps secrets out of argv.
     key_stream() {
@@ -103,9 +104,17 @@ if "$engine" exec "$container" bash -c 'command -v openssl' > /dev/null; then
     printf "%s.%s" "$input" "$signature"
   ')"
   if [ -n "$token" ]; then
-    case "$(http_status "$pgrst_port" "Bearer $token")" in
+    # Anonymous rejection needs no database; wait for the schema cache too.
+    # Only unavailable responses are transient, not JWT or permission failures.
+    status=
+    for _ in $(seq 60); do
+      status="$(http_status "$pgrst_port" "Bearer $token" || true)"
+      case "$status" in '' | *' 503 '*) ;; *) break ;; esac
+      sleep 1
+    done
+    case "$status" in
       *' 200 '*) check postgrest-password-jwt accepted accepted ;;
-      *) check postgrest-password-jwt refused accepted ;;
+      *) check postgrest-password-jwt "${status:-no HTTP response}" 'HTTP 200' ;;
     esac
   else
     echo 'skip postgrest-password-jwt: requires the default secret and a password of at least 32 bytes'
