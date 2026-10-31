@@ -110,6 +110,8 @@ connection, which needs a socket-owning proxy on every request or systemd
 socket activation. The image cannot run systemd, and proxying adds a hop and
 another process to supervise. Cost: idle services consume memory even when
 unused; disable unwanted services with their environment switches. Check:
-compare idle RSS on the built image before reconsidering a proxy.
-
-<!-- idle RSS: filled in after the host run -->
+compare idle RSS on the built image before reconsidering a proxy. On
+2026-10-31, an idle default container (18.6, nixpkgs 1c89083e, podman) showed
+PostgREST at 20 MB RSS and PgBouncer at 18 MB, both including shared libraries,
+against 52 MB for the postmaster alone. Read it with
+`grep VmRSS /proc/<pid>/status` inside the container.
