@@ -47,6 +47,13 @@
 
       locales = pkgs.glibcLocales.override { allLocales = false; locales = [ "en_US.UTF-8/UTF-8" "C.UTF-8/UTF-8" ]; };
 
+      # PgBouncer's systemd integration adds a large, unused runtime dependency.
+      pgbouncer = pkgs.pgbouncer.overrideAttrs (a: {
+        buildInputs = builtins.filter (p: (p.pname or "") != "systemd") a.buildInputs;
+        configureFlags = (a.configureFlags or []) ++ [ "--without-systemd" ];
+      });
+      postgrest = pkgs.lib.getBin pkgs.postgrest;
+
       nss = pkgs.runCommand "postgres-nss" { } ''
         mkdir -p $out/etc
         echo 'root:x:0:0:root:/root:/bin/bash' > $out/etc/passwd
@@ -58,29 +65,31 @@
 
       entrypoint = pkgs.writeShellApplication {
         name = "docker-entrypoint";
-        runtimeInputs = [ postgres pkgs.coreutils pkgs.gzip pkgs.openssl ];
+        runtimeInputs = [ postgres pgbouncer postgrest pkgs.pgweb pkgs.s6 pkgs.coreutils pkgs.gzip pkgs.openssl ];
         text = builtins.readFile ./entrypoint.sh;
       };
 
       image = pkgs.dockerTools.buildLayeredImage {
         name = "postgres-sunday-roast";
         tag = pkgs.postgresql_18.version;
-        contents = [ postgres entrypoint nss locales pkgs.bashInteractive pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.gzip pkgs.openssl pkgs.tzdata pkgs.cacert ];
+        contents = [ postgres pgbouncer postgrest pkgs.pgweb pkgs.s6 entrypoint nss locales pkgs.bashInteractive pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.gzip pkgs.openssl pkgs.tzdata pkgs.cacert ];
         fakeRootCommands = ''
-          mkdir -p ./tmp ./run/postgresql ./var/lib/postgresql ./docker-entrypoint-initdb.d ./usr/bin
+          mkdir -p ./tmp ./run/postgresql ./run/psr-services ./var/lib/postgresql ./docker-entrypoint-initdb.d ./usr/bin
           # Init scripts often start with #!/usr/bin/env bash.
           ln -s /bin/env ./usr/bin/env
           chmod 1777 ./tmp
-          chown 999:999 ./run/postgresql ./var/lib/postgresql
+          chown 999:999 ./run/postgresql ./run/psr-services ./var/lib/postgresql
           chmod 2775 ./run/postgresql
         '';
         config = {
           User = "999:999";
           Entrypoint = [ "/bin/docker-entrypoint" ];
-          # SIGTERM is a smart shutdown that waits for idle pooled connections
-          # until the runtime kills the server; SIGINT is a clean fast shutdown.
-          StopSignal = "SIGINT";
+          # s6 stops the tree; postgres receives SIGINT for a fast shutdown.
+          StopSignal = "SIGTERM";
           ExposedPorts."5432/tcp" = { };
+          ExposedPorts."6432/tcp" = { };
+          ExposedPorts."3000/tcp" = { };
+          ExposedPorts."8081/tcp" = { };
           Volumes."/var/lib/postgresql" = { };
           Labels = {
             "org.opencontainers.image.source" = "https://github.com/jbsiddall/Postgres-Sunday-Roast";
@@ -100,7 +109,8 @@
     in {
       packages.${system} = {
         default = image;
-        inherit postgres;
+        inherit postgres pgbouncer postgrest;
+        inherit (pkgs) pgweb s6;
       };
     };
 }
