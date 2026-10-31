@@ -28,25 +28,67 @@ jobs:
         run: |
           nix build .#default -o image.tar.gz -L
           echo "VERSION=$(nix eval --raw .#default.imageTag)" >> "$GITHUB_ENV"
+          # PostgreSQL already links systemd-minimal-libs; the services must add none.
+          if nix path-info -r .#pgbouncer .#postgrest .#pgweb .#s6 | grep systemd; then exit 1; fi
       - name: Smoke test
         run: |
           docker load < image.tar.gz
-          docker run -d --name smoke -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=app \
+          docker run -d --name smoke --cap-drop=ALL --security-opt=no-new-privileges \
+            -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=app -e PGWEB_ENABLED=1 \
             -v "$PWD/tests/initdb:/docker-entrypoint-initdb.d:ro" "postgres-sunday-roast:$VERSION"
           tests/smoke.sh smoke docker
+      - name: Service switches and PostgreSQL failure
+        run: |
+          wait_postgres() {
+            for _ in $(seq 90); do
+              if docker exec "$1" pg_isready -h 127.0.0.1 -q; then return; fi
+              sleep 1
+            done
+            docker logs "$1"
+            return 1
+          }
+          listening() {
+            docker exec "$1" bash -c 'exec 3<>/dev/tcp/127.0.0.1/"$1"' bash "$2" 2>/dev/null
+          }
+          docker run -d --name defaults -e POSTGRES_PASSWORD=smoke-only "postgres-sunday-roast:$VERSION"
+          wait_postgres defaults
+          # Wait for the default services before checking the disabled listener.
+          for _ in $(seq 60); do
+            if listening defaults 6432 && listening defaults 3000; then break; fi
+            sleep 1
+          done
+          listening defaults 6432
+          listening defaults 3000
+          if listening defaults 8081; then exit 1; fi
+          # Killing the postmaster must end the whole tree, not restart postgres.
+          docker exec defaults bash -c 'read -r pid < "$PGDATA/postmaster.pid"; kill -KILL "$pid"'
+          timeout 15 docker wait defaults
+          test "$(docker inspect defaults --format '{{.State.Running}}')" = false
+          test "$(docker inspect defaults --format '{{.State.ExitCode}}')" != 0
+          docker run -d --name disabled --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --tmpfs /run/postgresql:mode=1777 --tmpfs /run/psr-services:mode=1777 --tmpfs /tmp \
+            -e POSTGRES_PASSWORD=smoke-only \
+            -e PGBOUNCER_ENABLED=false -e POSTGREST_ENABLED=false "postgres-sunday-roast:$VERSION"
+          wait_postgres disabled
+          for port in 6432 3000 8081; do
+            if listening disabled "$port"; then exit 1; fi
+          done
+          docker stop disabled
+          test "$(docker inspect disabled --format '{{.State.ExitCode}}')" = 0
       - name: Commands
         run: |
           docker run --rm "postgres-sunday-roast:$VERSION" postgres --version
           docker run --rm "postgres-sunday-roast:$VERSION" psql --version
-          # A busy client must not hold up a stop: SIGINT is a fast shutdown, so
-          # the server exits 0 rather than being killed after the timeout.
+          # s6 sends postgres SIGINT, so a busy client cannot hold up a stop.
           docker exec -d smoke psql -h /run/postgresql -U postgres -c 'select pg_sleep(600)'
+          docker exec -d smoke bash -c 'PGPASSWORD=$POSTGRES_PASSWORD psql "host=127.0.0.1 port=6432 user=postgres dbname=postgres" -c "select pg_sleep(600)"'
           sleep 2
           docker stop smoke
           test "$(docker inspect smoke --format '{{.State.ExitCode}}')" = 0
       - name: Logs on failure
         if: failure()
-        run: docker logs smoke || true
+        run: |
+          for container in smoke defaults disabled; do docker logs "$container" || true; done
       - name: Size
         run: |
           docker image inspect "postgres-sunday-roast:$VERSION" --format '{{.Size}}' |
