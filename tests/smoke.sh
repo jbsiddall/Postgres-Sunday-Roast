@@ -134,6 +134,8 @@ if "$engine" exec "$container" bash -euo pipefail -c '
   for proc in /proc/[0-9]*; do
     # A backend can exit at any point here; skip it rather than fail the scan.
     read -r name < "$proc/comm" 2>/dev/null || continue
+    # Nix wraps postgres; comm holds the wrapped name cut to 15 bytes.
+    case "$name" in .postgres-wrapp) name=postgres ;; esac
     case "$name" in postgres | pgbouncer | postgrest | pgweb | s6-svscan) ;; *) continue ;; esac
     cat "$proc/environ" > "$copy" 2>/dev/null || continue
     audited[$name]=1
