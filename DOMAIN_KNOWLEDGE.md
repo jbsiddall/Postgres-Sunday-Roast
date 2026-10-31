@@ -15,6 +15,17 @@ on with nothing. The interactive bash at `/bin/bash` does have it. Use
 
 ## Nix
 
+### Closure queries need explicit runtime outputs
+
+With Nix 2.34.7 and nixpkgs 1c89083e, `nix path-info -r .#s6` selects
+`meta.outputsToInstall = [ "out" "man" ]`, not just the `out` path used by
+the image. The image build does not realise `man`; querying a missing output
+fails with `path '…-s6-2.15.1.0-man' is not valid` even when Nix announces
+that it can fetch it. Use `'.#s6^out'` and explicitly select PostgREST's
+`bin` output when auditing the service runtime closures. Keep the Nix query
+in a separate assignment before grep so query failures stop CI instead of
+silently passing as an empty closure. Observed 2026-10-31.
+
 ### PostgreSQL processes are named `.postgres-wrapp`
 
 nixpkgs wraps the `postgres` binary, so `/proc/<pid>/comm` for the postmaster

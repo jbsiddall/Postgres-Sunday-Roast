@@ -90,8 +90,12 @@ or commas cannot be represented in PgBouncer's user lists. The pooler assumes
 trusted local auth. Check: smoke tests exercise TCP passwords, a newly created
 role, TLS, wrong-password rejection and `show pools`. On the pinned nixpkgs,
 removing systemd from PgBouncer's build inputs and appending `--without-systemd`
-reduces its added closure from 88 MB to 2 MB; audit the final runtime closure
-for systemd after building.
+reduces its added closure from 88 MB to 2 MB. After building, CI audits the
+recursive runtime closures of PgBouncer, pgweb and s6's `out` outputs and
+PostgREST's `bin` output, matching the outputs shipped in the image. Any
+systemd path in those service closures fails the check; PostgreSQL's existing
+`systemd-minimal-libs` dependency is outside this audit. Explicit output
+selectors avoid querying unbuilt documentation selected by `meta.outputsToInstall`.
 
 ## PostgREST defaults JWT authentication to the database password
 

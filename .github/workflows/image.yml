@@ -34,7 +34,9 @@ jobs:
           nix build .#default -o image.tar.gz -L
           echo "VERSION=$(nix eval --raw .#default.imageTag)" >> "$GITHUB_ENV"
           # PostgreSQL already links systemd-minimal-libs; the services must add none.
-          closure="$(nix path-info -r .#pgbouncer .#postgrest .#pgweb .#s6)"
+          # Audit the outputs shipped in the image, not meta.outputsToInstall
+          # (s6 also selects man, which the image build does not realise).
+          closure="$(nix path-info -r '.#pgbouncer^out' '.#postgrest^bin' '.#pgweb^out' '.#s6^out')"
           if grep systemd <<< "$closure"; then exit 1; fi
       - name: Smoke test
         run: |
