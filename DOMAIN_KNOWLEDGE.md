@@ -34,3 +34,19 @@ process filter that matches `comm` against `postgres` silently selects
 nothing. Observed in the 18.6 image built from nixpkgs 1c89083e, 2026-10-31,
 with podman: 11 processes, all `.postgres-wrapp`. `pgbouncer`, `postgrest`,
 `pgweb` and `s6-svscan` keep their own names.
+
+## PostgREST
+
+### Anonymous rejection does not establish readiness
+
+PostgREST 14.16 authenticates before checking its schema cache or using the
+database. With no anonymous role, an anonymous request returns 401 even while
+a valid JWT gets 503 because the schema cache is still loading or the database
+connection is unavailable. The smoke test's anonymous check silently treated
+this as readiness, then sampled the authenticated request only once. Retry
+unavailable responses, but fail immediately on JWT or permission errors. The
+admin server's `/ready` endpoint also checks readiness, but its listener is
+disabled by default in this image. Confirmed from the pinned source and a
+local run without a database, 2026-10-31. See
+[request ordering](https://github.com/PostgREST/postgrest/blob/v14.16/src/PostgREST/App.hs#L121-L170)
+and [error statuses](https://github.com/PostgREST/postgrest/blob/v14.16/src/PostgREST/Error.hs#L693-L739).
