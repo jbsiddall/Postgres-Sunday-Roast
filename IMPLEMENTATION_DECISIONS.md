@@ -61,8 +61,13 @@ A stop marker distinguishes
 normal shutdown from PostgreSQL failure. Its finish script stops svscan, returns
 125 to prevent restart, and passes a failure status to svscan's finish script.
 Rejected: systemd, root at startup, and restarting PostgreSQL inside the
-container. Cost: `/run/psr-services` must be writable (an `emptyDir` with a read
-only root filesystem); a PostgreSQL exit requires a container restart. Check:
+container. Also rejected: immutable launcher wrappers to interpret scripts on
+a noexec runtime mount; s6 executes run, finish and signal scripts directly,
+so wrappers would add indirection for each hook. Cost: `/run/psr-services` must
+be writable and executable (`--tmpfs /run/psr-services:exec,mode=1777` in Docker,
+or a Kubernetes `emptyDir` with a read-only root filesystem); a PostgreSQL exit
+requires a container restart. Check: CI starts services on a read-only root
+with the explicit exec tmpfs flag.
 CI runs as uid 999, stops with a busy `pg_sleep(600)` client and requires exit 0
 within Docker's default timeout, then kills PostgreSQL and requires a nonzero
 container exit. Other services remain under s6's normal restart policy.
@@ -88,20 +93,52 @@ removing systemd from PgBouncer's build inputs and appending `--without-systemd`
 reduces its added closure from 88 MB to 2 MB; audit the final runtime closure
 for systemd after building.
 
-## HTTP services require explicit access configuration
+## PostgREST defaults JWT authentication to the database password
 
 Choice: PostgREST starts by default on port 3000 and connects directly over the
-socket, with only URI, schema and port defaults. Its native connection retry
-handles startup ordering. No anonymous role or JWT secret is supplied. pgweb
-starts only with `PGWEB_ENABLED`, listens on port 8081 in sessions mode, and
-reads optional basic-auth credentials from its environment. Rejected: automatic
-anonymous API access, a default JWT secret, and preconnecting pgweb as the
-superuser. Cost: PostgREST needs a restricted authenticator and explicit grants
-before use; pgweb can reach any host the container can reach and must stay
-private. PostgREST's binary output avoids the Haskell library closure. Check:
-the smoke test requires an anonymous API refusal and, when enabled, a pgweb
-HTTP response; CI also checks pgweb is off by default and both default services
-can be disabled.
+socket. Its native connection retry handles startup ordering. Per the user
+request on 2026-10-31, when both JWT secret inputs are unset, use the expanded
+`POSTGRES_PASSWORD` if it has at least 32 bytes. Otherwise leave JWT unset,
+warning for short passwords without stopping the container. Preserve all
+explicit `PGRST_*` inputs and leave the anonymous role unset. Rejected: always
+requiring a separate JWT secret and automatic anonymous API access. Cost: with
+the default superuser URI, the token issuer holds the superuser password and
+can issue superuser tokens; short passwords disable JWT. Production needs a
+separate signing secret, a restricted authenticator and explicit grants.
+PostgREST's binary output avoids the Haskell library closure. Check:
+`tests/smoke.sh` requires anonymous refusal and accepts an HS256 token signed
+with `POSTGRES_PASSWORD`; CI starts a short-password container and requires
+the warning. PostgREST v14's `Config.parseSecret` checks at least 32 bytes
+during startup, so setting a short secret would prevent it from starting.
+
+## pgweb always requires basic auth
+
+Choice: pgweb starts only with `PGWEB_ENABLED`, listens on port 8081 in sessions
+mode, and reads basic-auth credentials from its environment. Per the user
+request on 2026-10-31, default the login to `POSTGRES_USER` and the expanded
+`POSTGRES_PASSWORD`; explicit `PGWEB_AUTH_USER` and `PGWEB_AUTH_PASS` or its
+file form win. Fail container startup when enabled without a resolved password.
+Rejected: optional basic auth, unauthenticated startup when the database uses
+trust or has an existing data directory, and preconnecting pgweb as superuser.
+Cost: the default web login equals the database superuser login; pgweb can
+reach any host the container can reach and must stay private. Check:
+`tests/smoke.sh` requires HTTP 401 without credentials and HTTP 200 with the
+default database credentials; CI requires a clear failure with no password.
+The pinned pgweb 0.17.0 options support both auth flags and the prefixed envs.
+
+## Service credentials stay with their consumer
+
+Choice: save each enabled service's environment in a mode-0600 shell file,
+load it in that service's run script, and clear the service variables before
+execing s6. PostgREST gets all `PGRST_*`, pgweb its basic-auth pair, PostgreSQL
+its `PG*` variables excluding other services, and PgBouncer needs no environment
+credentials with socket auth. Disabled services get no environment file.
+Rejected: inheriting all expanded secrets in every process and putting secrets
+in argv. Cost: credential files remain in the writable runtime directory for
+service restarts; a shared uid and trusted socket are not a security boundary.
+Check: the smoke test reads actual `/proc/<pid>/environ` values, requiring no
+PostgREST JWT secret in PgBouncer, pgweb, PostgreSQL or s6 and no database
+bootstrap password in any service environment.
 
 ## No lazy service startup
 

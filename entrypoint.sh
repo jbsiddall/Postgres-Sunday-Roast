@@ -19,6 +19,14 @@ esac
 : "${PGDATA:?PGDATA must be set}"
 initdb_dir=/docker-entrypoint-initdb.d
 
+enabled() {
+  case "${1,,}" in
+    1 | true | yes | on) return 0 ;;
+    0 | false | no | off | '') return 1 ;;
+    *) echo "Invalid service switch: $1 (use true or false)" >&2; exit 1 ;;
+  esac
+}
+
 # Read VAR from the file named by VAR_FILE, for Docker and Kubernetes secrets.
 file_env() {
   local var="$1" file_var="$1_FILE"
@@ -31,15 +39,39 @@ file_env() {
     local value
     value="$(< "${!file_var}")"
     export "$var"="$value"
-    unset "$file_var"
+    # Keep every PGRST_* input available to PostgREST, including this helper.
+    if [ "$var" != PGRST_JWT_SECRET ]; then unset "$file_var"; fi
   fi
 }
-for name in POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB POSTGRES_INITDB_ARGS PGRST_JWT_SECRET PGWEB_AUTH_PASS; do
+for name in POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB POSTGRES_INITDB_ARGS; do
   file_env "$name"
 done
 export POSTGRES_USER="${POSTGRES_USER:-postgres}"
 export POSTGRES_DB="${POSTGRES_DB:-$POSTGRES_USER}"
 auth="${POSTGRES_HOST_AUTH_METHOD:-scram-sha-256}"
+
+if enabled "${POSTGREST_ENABLED-true}"; then
+  file_env PGRST_JWT_SECRET
+  if [[ ! -v PGRST_JWT_SECRET && ! -v PGRST_JWT_SECRET_FILE && -n "${POSTGRES_PASSWORD:-}" ]]; then
+    # PostgREST validates the UTF-8 byte length, before serving requests.
+    password_bytes="$(printf '%s' "$POSTGRES_PASSWORD" | wc -c)"
+    if [ "$password_bytes" -ge 32 ]; then
+      export PGRST_JWT_SECRET="$POSTGRES_PASSWORD"
+    else
+      echo "Warning: PostgREST JWT auth is off: POSTGRES_PASSWORD is shorter than 32 bytes; set PGRST_JWT_SECRET or use a password of at least 32 characters" >&2
+    fi
+  fi
+fi
+
+if enabled "${PGWEB_ENABLED-false}"; then
+  file_env PGWEB_AUTH_PASS
+  export PGWEB_AUTH_USER="${PGWEB_AUTH_USER:-$POSTGRES_USER}"
+  export PGWEB_AUTH_PASS="${PGWEB_AUTH_PASS:-${POSTGRES_PASSWORD:-}}"
+  if [ -z "$PGWEB_AUTH_PASS" ]; then
+    echo "pgweb requires basic auth: set PGWEB_AUTH_PASS or POSTGRES_PASSWORD (or their _FILE forms)" >&2
+    exit 1
+  fi
+fi
 
 umask 077
 mkdir -p "$PGDATA"
@@ -152,26 +184,30 @@ key="$("${server[@]}" -C ssl_key_file)"
 [[ "$cert" = /* ]] || cert="$PGDATA/$cert"
 [[ "$key" = /* ]] || key="$PGDATA/$key"
 
-enabled() {
-  case "${1,,}" in
-    1 | true | yes | on) return 0 ;;
-    0 | false | no | off | '') return 1 ;;
-    *) echo "Invalid service switch: $1 (use true or false)" >&2; exit 1 ;;
-  esac
-}
-
-# This directory is separate from PGDATA so an emptyDir can hold all s6 state.
+# This directory must permit execution: s6 executes its generated scripts.
 runtime=/run/psr-services
 services="$runtime/services"
 mkdir -p "$runtime"
 rm -rf "$services"
 mkdir -p "$services/.s6-svscan"
 service() {
-  local name="$1"
+  local name="$1" var
   shift
   mkdir -p "$services/$name"
+  # Secrets belong to their consumer, never the supervisor or command line.
   {
-    printf '#!/bin/bash\nexec '
+    for var in $(compgen -e); do
+      case "$name:$var" in
+        postgres:PGRST_* | postgres:PGWEB_* | postgres:PGBOUNCER_*) continue ;;
+        postgres:PG* | postgrest:PGRST_* | pgweb:PGWEB_AUTH_USER | pgweb:PGWEB_AUTH_PASS)
+          printf 'export %s=%q\n' "$var" "${!var}"
+          ;;
+      esac
+    done
+  } > "$services/$name/environment"
+  chmod 600 "$services/$name/environment"
+  {
+    printf '#!/bin/bash\nset -e\nsource ./environment\nexec '
     printf '%q ' "$@"
     printf '\n'
   } > "$services/$name/run"
@@ -288,4 +324,9 @@ if enabled "${PGWEB_ENABLED-false}"; then
     --bookmarks-dir="$runtime/bookmarks" --queries-dir="$runtime/queries"
 fi
 
+# PostgreSQL's init variables are no longer needed; restore only each service's
+# saved environment after exec has removed these values from /proc/1/environ.
+for name in ${!POSTGRES_@} ${!PG@} AUTH_USER AUTH_PASS; do
+  unset "$name"
+done
 exec s6-svscan "$services"

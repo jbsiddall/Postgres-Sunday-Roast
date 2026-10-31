@@ -51,10 +51,12 @@ psql -c 'drop role smoke_pool'
 http_status() {
   "$engine" exec "$container" bash -c '
     exec 3<>/dev/tcp/127.0.0.1/"$1"
-    printf "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3
+    printf "GET / HTTP/1.0\r\nHost: localhost\r\n" >&3
+    if [ -n "${2:-}" ]; then printf "Authorization: %s\r\n" "$2" >&3; fi
+    printf "\r\n" >&3
     read -r -t 5 status <&3
     printf "%s\n" "$status"
-  ' bash "$1" 2> /dev/null
+  ' bash "$1" "${2:-}" 2> /dev/null
 }
 pgrst_port="$("$engine" exec "$container" bash -c 'printf "%s" "${PGRST_SERVER_PORT:-3000}"')"
 status=
@@ -67,6 +69,88 @@ case "$status" in
   *' 401 '* | *' 403 '*) check postgrest-anonymous refused refused ;;
   *) check postgrest-anonymous "$status" 'HTTP 401 or 403' ;;
 esac
+
+# Mint with the database password, not the derived service environment.
+if "$engine" exec "$container" bash -c 'command -v openssl' > /dev/null; then
+  token="$("$engine" exec "$container" bash -euo pipefail -c '
+    password=${POSTGRES_PASSWORD:-}
+    if [ -n "${POSTGRES_PASSWORD_FILE:-}" ]; then password=$(< "$POSTGRES_PASSWORD_FILE"); fi
+    if [[ -v PGRST_JWT_SECRET || -v PGRST_JWT_SECRET_FILE ]] || [ "$(printf %s "$password" | wc -c)" -lt 32 ]; then exit; fi
+    b64url() { openssl base64 -A | tr "+/" "-_" | tr -d "="; }
+    header=$(printf %s '\''{"alg":"HS256","typ":"JWT"}'\'' | b64url)
+    # Smoke fixtures use the default postgres superuser.
+    payload=$(printf '\''{"role":"postgres","exp":%s}'\'' "$(( $(date +%s) + 60 ))" | b64url)
+    input=$header.$payload
+    # Build HMAC pads in bash so even the test keeps secrets out of argv.
+    key_stream() {
+      if [ "$(printf %s "$password" | wc -c)" -gt 64 ]; then
+        printf %s "$password" | openssl dgst -sha256 -binary
+      else
+        printf %s "$password"
+      fi
+    }
+    # Word splitting is intended: od emits decimal bytes.
+    # shellcheck disable=SC2207
+    key_bytes=( $(key_stream | od -An -v -tu1) )
+    pad() {
+      local i oct
+      for ((i=0; i<64; i++)); do
+        printf -v oct "%03o" "$(( ${key_bytes[i]:-0} ^ $1 ))"
+        printf "%b" "\\$oct"
+      done
+    }
+    signature=$({ pad 92; { pad 54; printf %s "$input"; } | openssl dgst -sha256 -binary; } | openssl dgst -sha256 -binary | b64url)
+    printf "%s.%s" "$input" "$signature"
+  ')"
+  if [ -n "$token" ]; then
+    case "$(http_status "$pgrst_port" "Bearer $token")" in
+      *' 200 '*) check postgrest-password-jwt accepted accepted ;;
+      *) check postgrest-password-jwt refused accepted ;;
+    esac
+  else
+    echo 'skip postgrest-password-jwt: requires the default secret and a password of at least 32 bytes'
+    if "$engine" exec "$container" bash -euo pipefail -c '
+      [[ ! -v PGRST_JWT_SECRET && ! -v PGRST_JWT_SECRET_FILE ]] || exit 1
+      password=${POSTGRES_PASSWORD:-}
+      if [ -n "${POSTGRES_PASSWORD_FILE:-}" ]; then password=$(< "$POSTGRES_PASSWORD_FILE"); fi
+      [ -n "$password" ] && [ "$(printf %s "$password" | wc -c)" -lt 32 ]
+    '; then
+      logs="$("$engine" logs "$container" 2>&1)"
+      if grep -qF 'PostgREST JWT auth is off' <<< "$logs"; then
+        check postgrest-short-password-warning logged logged
+      else
+        check postgrest-short-password-warning missing logged
+      fi
+    fi
+  fi
+else
+  echo 'skip postgrest-password-jwt: openssl is unavailable'
+fi
+
+# Read the actual exec environments, not docker exec's original container env.
+if "$engine" exec "$container" bash -euo pipefail -c '
+  found=0
+  for proc in /proc/[0-9]*; do
+    [ -r "$proc/comm" ] || continue
+    read -r name < "$proc/comm" || continue
+    case "$name" in postgres | pgbouncer | postgrest | pgweb | s6-svscan) ;; *) continue ;; esac
+    if [ "$name" = pgbouncer ]; then found=1; fi
+    while IFS= read -r -d "" entry; do
+      var=${entry%%=*}
+      case "$var" in
+        POSTGRES_PASSWORD | POSTGRES_PASSWORD_FILE) exit 1 ;;
+        PGRST_*) [ "$name" = postgrest ] || exit 1 ;;
+        PGWEB_AUTH_*) [ "$name" = pgweb ] || exit 1 ;;
+      esac
+    done < "$proc/environ"
+  done
+  [ "$found" = 1 ]
+'; then
+  check service-secret-environments isolated isolated
+else
+  check service-secret-environments leaked isolated
+fi
+
 pgweb_enabled="$("$engine" exec "$container" bash -c 'printf "%s" "${PGWEB_ENABLED:-false}"')"
 case "${pgweb_enabled,,}" in
   1 | true | yes | on)
@@ -78,8 +162,19 @@ case "${pgweb_enabled,,}" in
       sleep 1
     done
     case "$status" in
-      *' 200 '* | *' 401 '*) check pgweb-http answered answered ;;
-      *) check pgweb-http "$status" 'HTTP 200 or 401' ;;
+      *' 401 '*) check pgweb-basic-auth required required ;;
+      *) check pgweb-basic-auth "$status" 'HTTP 401' ;;
+    esac
+    basic="$("$engine" exec "$container" bash -euo pipefail -c '
+      password=${POSTGRES_PASSWORD:-}
+      if [ -n "${POSTGRES_PASSWORD_FILE:-}" ]; then password=$(< "$POSTGRES_PASSWORD_FILE"); fi
+      password=${PGWEB_AUTH_PASS:-$password}
+      if [ -n "${PGWEB_AUTH_PASS_FILE:-}" ]; then password=$(< "$PGWEB_AUTH_PASS_FILE"); fi
+      printf "%s:%s" "${PGWEB_AUTH_USER:-${POSTGRES_USER:-postgres}}" "$password" | base64 -w0
+    ')"
+    case "$(http_status "$pgweb_port" "Basic $basic")" in
+      *' 200 '*) check pgweb-login accepted accepted ;;
+      *) check pgweb-login refused accepted ;;
     esac
     ;;
 esac

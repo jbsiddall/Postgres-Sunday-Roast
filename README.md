@@ -58,7 +58,7 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `POSTGRES_PASSWORD` | required on first start | Password of `POSTGRES_USER`. Optional only with `POSTGRES_HOST_AUTH_METHOD=trust`. |
+| `POSTGRES_PASSWORD` | required on first start | Password of `POSTGRES_USER`. Optional for an existing cluster or with `POSTGRES_HOST_AUTH_METHOD=trust`. |
 | `POSTGRES_USER` | `postgres` | Superuser created on first start. |
 | `POSTGRES_DB` | `$POSTGRES_USER` | Database created on first start. |
 | `POSTGRES_INITDB_ARGS` | none | Extra `initdb` flags, e.g. `--data-checksums`. |
@@ -80,12 +80,16 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 | `PGRST_DB_URI` | socket, `$POSTGRES_USER`, `$POSTGRES_DB` | PostgREST's libpq connection string. Use a restricted authenticator before enabling requests. |
 | `PGRST_DB_SCHEMAS` | `public` | Schemas exposed by PostgREST. |
 | `PGRST_DB_ANON_ROLE` | unset | Role for anonymous requests; none are accepted by default. |
-| `PGRST_JWT_SECRET` | unset | JWT verification secret (at least 32 characters) or JWK/JWKS. |
-| `PGRST_JWT_SECRET_FILE` | unset | Read the JWT secret from this file instead. |
+| `PGRST_JWT_SECRET` | `$POSTGRES_PASSWORD` if at least 32 bytes | JWT verification secret or JWK/JWKS. Explicit values win; a short or missing password leaves JWT auth off. |
+| `PGRST_JWT_SECRET_FILE` | unset | Entrypoint helper: read the JWT secret from this file instead; prevents the password fallback. |
+| `PGRST_JWT_SECRET_IS_BASE64` | `false` | Decode the JWT secret as base64 before use. |
+| `PGRST_JWT_AUD` | unset | Expected JWT `aud` claim. |
+| `PGRST_JWT_ROLE_CLAIM_KEY` | `.role` | Path to the JWT claim containing the database role. |
+| `PGRST_DB_PRE_REQUEST` | unset | Schema-qualified function called before each API request. |
 | `PGWEB_ENABLED` | `false` | Start the web SQL client. |
 | `PGWEB_PORT` | `8081` | pgweb's HTTP port, bound to `0.0.0.0`. |
-| `PGWEB_AUTH_USER` | unset | Optional HTTP basic-auth user; also set a password. |
-| `PGWEB_AUTH_PASS` | unset | HTTP basic-auth password, read from the environment, not process arguments; also set a user. |
+| `PGWEB_AUTH_USER` | `$POSTGRES_USER` | HTTP basic-auth user when pgweb is enabled; explicit values win. |
+| `PGWEB_AUTH_PASS` | `$POSTGRES_PASSWORD` | Required HTTP basic-auth password when enabled, read from the environment, never process arguments; explicit values win. |
 | `PGWEB_AUTH_PASS_FILE` | unset | Read the basic-auth password from this file instead. |
 
 `POSTGRES_PASSWORD`, `POSTGRES_USER`, `POSTGRES_DB` and `POSTGRES_INITDB_ARGS`
@@ -134,7 +138,7 @@ different uid, `chown -R 999:999` it first.
 | --- | --- | --- |
 | PostgreSQL | `5432` | On |
 | PgBouncer | `6432` (`PGBOUNCER_PORT`) | On |
-| PostgREST | `3000` (`PGRST_SERVER_PORT`) | On, requests refused until configured |
+| PostgREST | `3000` (`PGRST_SERVER_PORT`) | On, anonymous requests refused |
 | pgweb | `8081` (`PGWEB_PORT`) | Off |
 
 Publish only the ports you need with `-p`. For example, add `-p 6432:6432`
@@ -166,11 +170,38 @@ Use `PGBOUNCER_POOL_MODE=session` or connect directly for session state. The
 pool size is per database/user pair, so many pairs can exhaust PostgreSQL's
 connection limit.
 
-PostgREST reads all `PGRST_*` variables natively and retries database connections
-while PostgreSQL starts. No anonymous role or JWT secret is set by default, so
-requests are refused. Before enabling API access, create a restricted login
-role and grant it only the API roles it should assume. For example, run this
-in the application database (or put it in an init script):
+PostgREST receives all user-supplied `PGRST_*` variables unchanged, alongside
+the defaults above, and retries database connections while PostgreSQL starts.
+These are the same variables as the official `postgrest/postgrest` image; see
+the [v14 configuration reference](https://docs.postgrest.org/en/v14/references/configuration.html)
+and [official Docker instructions](https://docs.postgrest.org/en/v14/explanations/install.html#docker).
+`PGRST_JWT_SECRET_FILE` is an entrypoint helper; the native file syntax is
+`PGRST_JWT_SECRET=@/path/to/secret`. Other native settings, including
+`PGRST_APP_SETTINGS_*`, also pass through.
+
+`PGRST_DB_ANON_ROLE` is optional and unset by default, so anonymous requests
+are refused. If both `PGRST_JWT_SECRET` and `PGRST_JWT_SECRET_FILE` are unset,
+the JWT secret defaults to `POSTGRES_PASSWORD` after `_FILE` expansion. A
+missing password leaves JWT unset. A password shorter than 32 bytes leaves
+JWT unset and prints a warning; the container still starts. PostgREST v14
+rejects an explicitly configured short secret at startup, before serving
+requests. The docs call this 32 characters; the implementation checks UTF-8
+bytes. Native secret formats and `PGRST_JWT_SECRET_IS_BASE64` still apply.
+
+To sign a token with the default secret, use HS256 with `POSTGRES_PASSWORD`
+as the signing key, a `role` claim naming the database role and a short-lived
+`exp` claim. For the default user, a payload such as
+`{"role":"postgres","exp":<Unix expiry time>}` gets superuser access over
+HTTP with the default `PGRST_DB_URI`. Send the token as
+`Authorization: Bearer <token>`. Signing requires the superuser password, so
+this adds no privilege beyond that credential, but the token issuer now holds
+the superuser password. Production should set a separate `PGRST_JWT_SECRET`
+and use a restricted authenticator. The smoke test includes an OpenSSL HS256
+signing example.
+
+Create a restricted login role and grant it only the API roles it should
+assume. For example, run this in the application database (or put it in an
+init script):
 
 ```sql
 create role authenticator login noinherit;
@@ -192,19 +223,46 @@ PGRST_JWT_SECRET_FILE=/run/secrets/postgrest-jwt
 The secret file must hold a random secret of at least 32 characters (or a
 JWK/JWKS). Grant additional API roles to `authenticator` as needed. Leaving
 `PGRST_DB_URI` as the default superuser means any valid JWT can switch to any
-role, including superusers. Change the URI before setting a JWT secret or an
-anonymous role. See the [PostgREST role model](https://docs.postgrest.org/en/v14/references/auth.html).
+role, including superusers. Use the restricted URI with a separate JWT secret
+and explicit grants. See the [PostgREST role model](https://docs.postgrest.org/en/v14/references/auth.html).
 
 Enable pgweb with `PGWEB_ENABLED=1` and publish port 8081. It starts in sessions
-mode with no preconfigured database; enter a database URL in the browser. Set
-both `PGWEB_AUTH_USER` and `PGWEB_AUTH_PASS` (or `PGWEB_AUTH_PASS_FILE`) for
-basic authentication, and use a TLS reverse proxy for remote access. pgweb can
+mode with no preconfigured database; enter a database URL in the browser.
+HTTP basic auth is always enabled: the login defaults to `POSTGRES_USER`
+(`postgres`) and `POSTGRES_PASSWORD` after `_FILE` expansion. Explicit
+`PGWEB_AUTH_USER` and `PGWEB_AUTH_PASS` (or `PGWEB_AUTH_PASS_FILE`) override
+the defaults. If no password resolves, startup fails with an error asking for
+`PGWEB_AUTH_PASS` or `POSTGRES_PASSWORD`, even on an existing database or with
+trust authentication. The default web login equals the database superuser
+login; set separate web credentials when that is unsuitable. pgweb 0.17.0
+supports `--auth-user` / `--auth-pass`; this image uses its native
+`PGWEB_AUTH_USER` / `PGWEB_AUTH_PASS` environment variables to keep the password
+out of process arguments. Use a TLS reverse proxy for remote access. pgweb can
 connect to any host the container can reach, including databases on trusted
 local sockets. Do not expose it publicly.
 
 Enabled services start together under `s6-svscan` as PID 1, with no root,
 capabilities or systemd. Services do not start lazily on the first connection;
 the tradeoff is recorded in [IMPLEMENTATION_DECISIONS.md](IMPLEMENTATION_DECISIONS.md).
+
+Service environments contain only their own settings: PostgREST gets `PGRST_*`,
+pgweb gets its basic-auth credentials, PostgreSQL keeps its `PG*` settings,
+and PgBouncer reads its password-free configuration. s6 inherits none of these
+credentials. This reduces accidental disclosure in process diagnostics; all
+services still run as the same uid and share trusted local database access.
+
+For a read-only Docker root filesystem, keep data on a volume and mount:
+
+```sh
+docker run -d --name pg --read-only \
+  --tmpfs /run/postgresql:mode=1777 \
+  --tmpfs /run/psr-services:exec,mode=1777 --tmpfs /tmp \
+  -e POSTGRES_PASSWORD=change-me -v pgdata:/var/lib/postgresql \
+  ghcr.io/jbsiddall/postgres-sunday-roast:18
+```
+
+`/run/psr-services` must permit execution because s6 executes generated run
+and shutdown scripts there. Docker tmpfs mounts need the explicit `exec` flag.
 
 ### Docker Compose
 
@@ -230,6 +288,9 @@ the volume at `/var/lib/postgresql`. `runAsNonRoot: true` is supported. With
 `readOnlyRootFilesystem: true`, also mount writable `emptyDir` volumes at
 `/run/postgresql`, `/run/psr-services` (s6 state and generated configuration)
 and `/tmp`, owned by uid 999 or writable through `fsGroup: 999`.
+Kubernetes `emptyDir` volumes permit execution by default; no Docker-style
+`exec` option is needed. A cluster policy or mount override must not make
+`/run/psr-services` `noexec`.
 
 PostgreSQL refuses a private key that others can read. To use a certificate
 from a TLS Secret, mount it with `defaultMode: 0440`. The files are then owned
@@ -302,14 +363,17 @@ To add an extension, find its attribute name under `postgresql18Packages` on
 add it to the list in `flake.nix`, then run the smoke test against a container:
 
 ```sh
-docker run -d --name smoke -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=app \
+docker run -d --name smoke -e POSTGRES_PASSWORD=smoke-only-at-least-32-characters \
+  -e POSTGRES_DB=app -e PGWEB_ENABLED=1 \
   -v "$PWD/tests/initdb:/docker-entrypoint-initdb.d:ro" postgres-sunday-roast:18.6
 tests/smoke.sh smoke docker
 ```
 
 The smoke test checks SSL, PgBouncer authentication and TLS, PostgREST's refusal
-of anonymous requests, pgweb when enabled, the preloaded libraries, init scripts
-and `pg_cron`, then creates every available extension. CI also checks service
+of anonymous requests, a JWT signed with the default password (when OpenSSL is
+available), service secret isolation, pgweb basic auth when enabled, the
+preloaded libraries, init scripts and `pg_cron`, then creates every available
+extension. CI also checks service
 switches and shutdown, runs on every pull request and pushes the image to GHCR
 from `main`.
 
