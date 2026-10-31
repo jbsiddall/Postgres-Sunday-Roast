@@ -129,12 +129,14 @@ fi
 
 # Read the actual exec environments, not docker exec's original container env.
 if "$engine" exec "$container" bash -euo pipefail -c '
-  found=0
+  declare -A audited=()
+  copy="$(mktemp)"
   for proc in /proc/[0-9]*; do
-    [ -r "$proc/comm" ] || continue
-    read -r name < "$proc/comm" || continue
+    # A backend can exit at any point here; skip it rather than fail the scan.
+    read -r name < "$proc/comm" 2>/dev/null || continue
     case "$name" in postgres | pgbouncer | postgrest | pgweb | s6-svscan) ;; *) continue ;; esac
-    if [ "$name" = pgbouncer ]; then found=1; fi
+    cat "$proc/environ" > "$copy" 2>/dev/null || continue
+    audited[$name]=1
     while IFS= read -r -d "" entry; do
       var=${entry%%=*}
       case "$var" in
@@ -142,9 +144,11 @@ if "$engine" exec "$container" bash -euo pipefail -c '
         PGRST_*) [ "$name" = postgrest ] || exit 1 ;;
         PGWEB_AUTH_*) [ "$name" = pgweb ] || exit 1 ;;
       esac
-    done < "$proc/environ"
+    done < "$copy"
   done
-  [ "$found" = 1 ]
+  rm -f "$copy"
+  # The long-lived services must have been read, not skipped.
+  for name in s6-svscan postgres pgbouncer postgrest; do [ -n "${audited[$name]:-}" ]; done
 '; then
   check service-secret-environments isolated isolated
 else

@@ -157,6 +157,17 @@ test ! -d "$work/runtime/services/pgweb"
 isolated
 echo 'ok   disabled services do not read or distribute their secrets'
 
+boot POSTGRES_PASSWORD="$password" PGWEB_ENABLED=1 PGSERVICEFILE=/run/secrets/pg_service.conf \
+  PGPASSFILE=/run/secrets/pgpass PGSSLROOTCERT=/run/secrets/ca.crt
+for service in postgres postgrest pgweb; do
+  has "$service" PGSERVICEFILE /run/secrets/pg_service.conf
+  has "$service" PGPASSFILE /run/secrets/pgpass
+  has "$service" PGSSLROOTCERT /run/secrets/ca.crt
+done
+absent pgbouncer PGSERVICEFILE
+isolated
+echo 'ok   libpq inputs reach the services that connect with libpq'
+
 # Run the workflow's audit itself with failing and successful Nix queries.
 audit="$(sed -n '/^          closure=/,/^          if grep systemd/p' "$repo/.github/workflows/image.yml")"
 test -n "$audit"

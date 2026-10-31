@@ -246,8 +246,10 @@ capabilities or systemd. Services do not start lazily on the first connection;
 the tradeoff is recorded in [IMPLEMENTATION_DECISIONS.md](IMPLEMENTATION_DECISIONS.md).
 
 Service environments contain only their own settings: PostgREST gets `PGRST_*`,
-pgweb gets its basic-auth credentials, PostgreSQL keeps its `PG*` settings,
-and PgBouncer reads its password-free configuration. s6 inherits none of these
+pgweb gets its basic-auth credentials, and PgBouncer reads its password-free
+configuration. PostgreSQL, PostgREST and pgweb also get the other `PG*`
+variables, which are libpq and server inputs such as `PGSERVICEFILE`,
+`PGPASSFILE` and `PGSSLROOTCERT`. s6 inherits none of these
 credentials. This reduces accidental disclosure in process diagnostics; all
 services still run as the same uid and share trusted local database access.
 

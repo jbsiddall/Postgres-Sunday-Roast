@@ -191,7 +191,7 @@ mkdir -p "$runtime"
 rm -rf "$services"
 mkdir -p "$services/.s6-svscan"
 service() {
-  local name="$1" var
+  local name="$1" var attrs
   shift
   mkdir -p "$services/$name"
   # Secrets belong to their consumer, never the supervisor or command line.
@@ -199,13 +199,18 @@ service() {
     # Every routed variable starts with PG. compgen would list exports, but the
     # image runs this script with a bash built without it, which fails silently.
     for var in ${!PG@}; do
-      [[ "$(declare -p "$var")" == "declare -"*x* ]] || continue
-      case "$name:$var" in
-        postgres:PGRST_* | postgres:PGWEB_* | postgres:PGBOUNCER_*) continue ;;
-        postgres:PG* | postgrest:PGRST_* | pgweb:PGWEB_AUTH_USER | pgweb:PGWEB_AUTH_PASS)
-          printf 'export %s=%q\n' "$var" "${!var}"
-          ;;
+      attrs="$(declare -p "$var")"
+      attrs="${attrs#declare -}"
+      [[ "${attrs%% *}" == *x* ]] || continue
+      case "$var" in
+        PGRST_*) [ "$name" = postgrest ] || continue ;;
+        PGWEB_AUTH_USER | PGWEB_AUTH_PASS) [ "$name" = pgweb ] || continue ;;
+        PGWEB_* | PGBOUNCER_*) continue ;;
+        # Other PG* are libpq and server inputs, such as PGSERVICEFILE or
+        # PGPASSFILE. PgBouncer reads none; it uses its config and the socket.
+        *) [ "$name" != pgbouncer ] || continue ;;
       esac
+      printf 'export %s=%q\n' "$var" "${!var}"
     done
   } > "$services/$name/environment"
   chmod 600 "$services/$name/environment"

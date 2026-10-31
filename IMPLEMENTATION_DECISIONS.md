@@ -130,13 +130,18 @@ The pinned pgweb 0.17.0 options support both auth flags and the prefixed envs.
 
 Choice: save each enabled service's environment in a mode-0600 shell file,
 load it in that service's run script, and clear the service variables before
-execing s6. PostgREST gets all `PGRST_*`, pgweb its basic-auth pair, PostgreSQL
-its `PG*` variables excluding other services, and PgBouncer needs no environment
-credentials with socket auth. Disabled services get no environment file.
+execing s6. PostgREST gets all `PGRST_*` and pgweb its basic-auth pair.
+PostgreSQL, PostgREST and pgweb also get every other `PG*` variable, because
+those are libpq and server inputs (`PGSERVICEFILE`, `PGPASSFILE`, TLS paths).
+PgBouncer needs no environment with socket auth. Variables are listed with
+`${!PG@}`, not `compgen`: the image runs the entrypoint with a bash built
+without `compgen`, and there it fails silently. Disabled services get no environment file.
 Rejected: inheriting all expanded secrets in every process and putting secrets
 in argv. Cost: credential files remain in the writable runtime directory for
 service restarts; a shared uid and trusted socket are not a security boundary.
-Check: the smoke test reads actual `/proc/<pid>/environ` values, requiring no
+Check: `tests/entrypoint.sh`, run with the image's bash, covers routing of
+libpq inputs and secrets; the smoke test reads actual `/proc/<pid>/environ`
+values, requiring no
 PostgREST JWT secret in PgBouncer, pgweb, PostgreSQL or s6 and no database
 bootstrap password in any service environment.
 
