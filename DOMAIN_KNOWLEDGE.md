@@ -67,6 +67,17 @@ reproduced PostgreSQL 18.6 refusing mode 2770 with "invalid permissions" and
 requiring 0700 or 0750; this was a local permission reproduction, not a
 Kubernetes deployment test.
 
+Read on 2026-10-31: the same kubelet v1.35.0 implementation ORs 0660 into
+regular files on writable volumes, turning a 0600 TLS key into 0660. A
+root-owned 0640 key also becomes 0660. The
+[PostgreSQL 18 SSL rules](https://www.postgresql.org/docs/18/ssl-tcp.html)
+allow no group/world access on a database-owned key, or group read access on a
+root-owned key, but never group write. Resetting only PGDATA to 0700 leaves
+those broadened key modes unchanged. The 2026-10-31 review reproduced this
+locally with PostgreSQL 18.6 and a real key: 0700/0600 started, 0700/0660
+failed with "has group or world access", and restoring only the key to 0600
+started again. This applied the source-derived mask, not a live kubelet mount.
+
 The v1.35.0
 [emptyDir implementation](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go)
 creates default directory-backed volumes with mode 0777 and corrects
@@ -124,6 +135,11 @@ defines timestamps as int64.
 999:999 with a read-only root and default `emptyDir: {}` mounts at
 `/run/postgresql`, `/run/psr-services` and `/tmp` remains an inference from
 kubelet v1.35.0 source and the image's startup writes, read on 2026-10-31.
+
+[unverified: storage driver not specified or exercised] A fresh filesystem PVC
+may present a root-owned mount; its ownership and modes depend on the storage
+provisioner. Whether a particular PVC is writable by 999:999 without preparation
+is not established by the image's directory ownership or the emptyDir source.
 
 [unverified: no container runtime in the editing environment] The official
 volume round trip and whether this exact glibc change logs a collation-version

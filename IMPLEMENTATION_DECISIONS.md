@@ -56,23 +56,34 @@ that override; never move or delete data. A volume for another uid needs
 ownership corrected before startup; running as root and dropping privileges
 would break `runAsNonRoot` and require another helper.
 
-Choice: on every start, reset an existing PGDATA owned by the current user to
-mode 0700, like the official entrypoint. Only chmod the directory itself,
-never chown or change its contents. As upstream does, ignore chmod failure
-and let PostgreSQL check access. This repairs mode 2770 after kubelet reapplies
-`fsGroup` to a retained or imported cluster. Rejected: preserving every existing
-mode, which prevents those clusters from restarting; requiring deployments to
-avoid `fsGroup`; and checking mode bits to repair only rejected modes while
-preserving 0750, which adds a separate policy from upstream. Cost: existing
-0750 clusters lose group access through PGDATA on restart, as they do under
-the official image; their contained files keep their modes. This is the
-smallest change that matches upstream and keeps its clusters starting.
-Evidence, checked 2026-10-31: the pinned
+Choice: omit pod-wide `fsGroup` for fresh and imported Kubernetes volumes.
+Prepare data-volume ownership once for 999:999 without broadening restricted
+file modes. Default directory-backed `emptyDir` runtime mounts are already
+writable by that user. Keep the existing owned-PGDATA chmod to 0700 on every
+start, ignoring failure as upstream does, for directories previously remounted
+under `fsGroup`. Never chown or change anything inside PGDATA.
+Rejected: relying on that directory repair with `fsGroup`, which leaves a TLS
+key changed from 0600 to 0660 and prevents PostgreSQL starting; repairing keys
+at startup, which changes user files; and relying on `OnRootMismatch`, which
+can still recurse when the volume root does not match. Also rejected:
+preserving 0750 separately from upstream's directory policy. Cost: deployments
+must prepare volume ownership and supplied TLS key access separately; direct
+TLS Secret mounts cannot rely on `fsGroup` to grant group access. Existing
+0750 clusters lose group access through PGDATA on restart; contained files
+keep their modes.
+Evidence, checked 2026-10-31: kubelet v1.35.0's
+[permission handling](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/volume_linux.go)
+ORs 0660 into writable-volume files and setgid/group rwx into directories;
+its [emptyDir setup](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go)
+uses 0777. [PostgreSQL 18](https://www.postgresql.org/docs/18/ssl-tcp.html)
+rejects group access on database-owned TLS keys and group write on root-owned
+keys. The pinned
 [official entrypoint](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh#L39-L41)
-runs `chmod 00700 "$PGDATA" || :`; its directory setup runs before the
-existing-cluster check. Check: `tests/entrypoint.sh` covers retained and
-imported clusters at 2770, existing 0700, and imported 0750 resetting to 0700,
-with ownership, contained files and server settings preserved.
+runs `chmod 00700 "$PGDATA" || :` before its existing-cluster check.
+Check: `tests/entrypoint.sh` covers retained/imported directory repairs and a
+real TLS key under the recursive mask, preserves its contents and broadened
+mode, and rejects any README recipe that sets `fsGroup`. The harness uses
+command stubs; the README documents that TLS case as unsupported.
 
 Imported clusters retain their files, authentication and
 server settings. Only the socket path is supplied for bundled services;

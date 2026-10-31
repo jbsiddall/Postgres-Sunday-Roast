@@ -286,45 +286,53 @@ volumes:
 
 ### Kubernetes
 
-For new and imported clusters, set `securityContext.runAsUser`, `runAsGroup`
-and `fsGroup` to 999 and mount the volume at `/var/lib/postgresql`.
-`runAsNonRoot: true` is supported. On volumes that support it, `fsGroup`
-makes the mount writable so 999:999 can create PGDATA. Imported clusters must
-already be owned by uid 999; the entrypoint never changes ownership. On every
-start it resets an existing PGDATA owned by the current user to mode 0700,
-matching the official image.
-This repairs permissions broadened by kubelet on a remount and also resets
-0750 clusters created with `initdb --allow-group-access`. Files and directories
-inside PGDATA are left alone.
+For new and imported clusters, set `securityContext.runAsUser` and
+`runAsGroup` to 999, with `runAsNonRoot: true`, and mount the data volume at
+`/var/lib/postgresql`. Prepare its ownership once for 999:999 before starting:
+for a fresh volume, make the mounted directory writable by 999:999; for an
+import, preserve the cluster's restricted file modes while arranging ownership
+for that user. A PVC does not inherit the image directory's ownership. Check
+the mounted filesystem and prepare it through your storage provisioner or a
+separate maintenance step; provisioning defaults depend on the storage driver.
+The entrypoint never changes ownership.
 
-With `readOnlyRootFilesystem: true`, also mount writable `emptyDir`
-volumes at
-`/run/postgresql`, `/run/psr-services` (s6 state and generated configuration)
-and `/tmp`.
-Kubernetes `emptyDir` volumes permit execution by default; no Docker-style
-`exec` option is needed. A cluster policy or mount override must not make
-`/run/psr-services` `noexec`.
+Do not set pod-wide `fsGroup`. Kubelet's recursive permission pass changes file
+modes inside supported volumes: a database-owned TLS key at 0600 becomes 0660,
+which [PostgreSQL 18 rejects](https://www.postgresql.org/docs/18/ssl-tcp.html).
+SSL keys on data volumes changed by `fsGroup` are unsupported. Before reusing
+such a volume, remove `fsGroup` and restore affected key permissions separately
+while the database is stopped. The entrypoint leaves every file inside PGDATA
+alone, including keys. Its generated keys live outside PGDATA under
+`/run/psr-services/tls.*`, with mode 0600; supplied keys stay at their configured
+paths and retain their modes.
+
+On every start, the entrypoint resets an existing PGDATA owned by the current
+user to mode 0700, matching the official image. This repairs the directory
+itself if a previous mount used `fsGroup` and also resets 0750 clusters created
+with `initdb --allow-group-access`. It does not repair file modes inside it.
+See the [kubelet v1.35.0 permission masks](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/volume_linux.go).
+
+With `readOnlyRootFilesystem: true`, also mount writable default
+`emptyDir: {}` volumes at `/run/postgresql`, `/run/psr-services` (s6 state,
+generated configuration and TLS keys) and `/tmp`. Kubelet v1.35.0
+[creates these directory-backed mounts with mode 0777](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go),
+so 999:999 can write without `fsGroup`. They permit execution by default; no
+Docker-style `exec` option is needed. A cluster policy or mount override must
+not make `/run/psr-services` `noexec`.
 
 For the remaining import checks, follow
 [Switching from the official image](#switching-from-the-official-image).
 
-PostgreSQL refuses a private key that others can read. To use a certificate
-from a TLS Secret, mount it with `defaultMode: 0440`. The files are then owned
-by root with group 999 and mode 0440, which PostgreSQL accepts. The default of
-0644 makes the server refuse to start.
-
-```yaml
-      containers:
-        - name: postgres
-          env:
-            - { name: POSTGRES_SSL_CERT_FILE, value: /etc/postgres-tls/tls.crt }
-            - { name: POSTGRES_SSL_KEY_FILE, value: /etc/postgres-tls/tls.key }
-          volumeMounts:
-            - { name: tls, mountPath: /etc/postgres-tls, readOnly: true }
-      volumes:
-        - name: tls
-          secret: { secretName: postgres-tls, defaultMode: 0440 }
-```
+For a supplied TLS pair, set `POSTGRES_SSL_CERT_FILE` and
+`POSTGRES_SSL_KEY_FILE` to the mounted paths. Prepare the key as owned by 999
+with mode 0600, or by root with mode 0640 and group 999, and ensure 999:999 can
+traverse its parent directories and read the certificate. A Kubernetes TLS
+Secret's `defaultMode: 0440` alone does not give its root-owned key group 999
+without `fsGroup`. Instead, arrange a separate prepared mount, for example by
+copying the Secret into a shared volume in an init container and setting the
+copy's ownership and mode before the database starts. Mount that prepared pair
+read-only in the database container and refresh the copy when rotating keys.
+Do not broaden the key's permissions to make it readable.
 
 Pin the image by digest
 (`ghcr.io/jbsiddall/postgres-sunday-roast@sha256:...`); each CI run prints the
@@ -379,22 +387,19 @@ This does not cover Alpine images, another architecture or another major version
      runAsUser: 999
      runAsGroup: 999
      runAsNonRoot: true
-     fsGroup: 999
    ```
 
-   As for new clusters, the entrypoint resets the PGDATA directory itself to
-   mode 0700 on every start when owned by the current user, including after
-   `fsGroup` has broadened it to 2770. The
+   Use the same [volume preparation as for new clusters](#kubernetes); do not
+   set `fsGroup`. Prepare ownership once for 999:999 without broadening key
+   permissions. The entrypoint resets only the PGDATA directory to 0700 when
+   owned by the current user, including a directory previously broadened to
+   2770. The
    [official entrypoint at e00e1bd](https://github.com/docker-library/postgres/blob/e00e1bd34ec5c8a8e7ad89b273b3d42efaf6d5bc/18/trixie/docker-entrypoint.sh#L39-L41)
    does the same, including resetting mode 0750 to 0700. Group access through
-   PGDATA is therefore removed; its contents are left alone. Arrange ownership
-   before starting; this entrypoint never chowns an existing cluster.
-   See [Kubernetes volume ownership](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#configure-volume-permission-and-ownership-change-policy-for-pods).
-   With a read-only root filesystem, mount default `emptyDir: {}` volumes at
-   `/run/postgresql`, `/run/psr-services` and `/tmp`; Kubernetes v1.35.0
-   [creates them with mode 0777](https://raw.githubusercontent.com/kubernetes/kubernetes/v1.35.0/pkg/volume/emptydir/empty_dir.go),
-   so all three paths are writable as 999:999 even without `fsGroup`.
-   Keep `/run/psr-services` executable, as above.
+   PGDATA is therefore removed; its contents are left alone. This entrypoint
+   never chowns an existing cluster or repairs TLS key modes.
+   With a read-only root filesystem, use the three writable default `emptyDir`
+   mounts described above and keep `/run/psr-services` executable.
    For example, with Docker:
 
    ```sh

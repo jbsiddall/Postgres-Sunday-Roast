@@ -303,6 +303,33 @@ for mode in 2770 750; do
   echo "ok   imported cluster resets $mode to 0700; ownership, contents and settings retained"
 done
 
+# A real TLS key exposes the file-mode effect missed by directory-only checks.
+# The server is stubbed, so assert the unsupported case stays out of recipes.
+boot TEST_SSL=on PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+  -out "$work/data/server.crt" -keyout "$work/data/server.key" 2> "$work/tls.log"
+chmod 600 "$work/data/server.key"
+test "$(stat -c %a "$work/data/server.key")" = 600
+printf "ssl = on\nssl_key_file = 'server.key'\n" >> "$work/data/postgresql.conf"
+sha256sum "$work/data/server.key" > "$work/key-before"
+# Kubelet v1.35.0 ORs 0660 into files and 02770 into directories.
+find "$work/data" -type f -exec chmod ug+rw '{}' +
+find "$work/data" -type d -exec chmod ug+rwx,g+s '{}' +
+data_mode "$work/data" 2770
+start TEST_SSL=on PGBOUNCER_ENABLED=false POSTGREST_ENABLED=false
+data_mode "$work/data" 700
+test "$(stat -c %a "$work/data/server.key")" = 660
+sha256sum "$work/data/server.key" > "$work/key-after"
+cmp "$work/key-before" "$work/key-after"
+if grep -Eq 'fsGroup[[:space:]]*:' "$repo/README.md"; then
+  echo 'FAIL README recommends fsGroup; imported TLS keys become 0660' >&2
+  exit 1
+fi
+# Match literal Markdown backticks.
+# shellcheck disable=SC2016
+grep -qF 'SSL keys on data volumes changed by `fsGroup` are unsupported.' "$repo/README.md"
+echo 'ok   imported TLS key stays 0660 after directory repair; README forbids fsGroup recipes'
+
 # Run the workflow's audit itself with failing and successful Nix queries.
 audit="$(sed -n '/^          closure=/,/^          if grep systemd/p' "$repo/.github/workflows/image.yml")"
 test -n "$audit"
