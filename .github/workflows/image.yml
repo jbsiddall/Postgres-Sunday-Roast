@@ -26,15 +26,18 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - name: Build
         run: |
+          # Run the harness with the bash writeShellApplication gives the entrypoint.
+          ENTRYPOINT_BASH="$(nix build --no-link --print-out-paths --inputs-from . "nixpkgs#runtimeShellPackage^out")/bin/bash" bash tests/entrypoint.sh
           nix build .#default -o image.tar.gz -L
           echo "VERSION=$(nix eval --raw .#default.imageTag)" >> "$GITHUB_ENV"
           # PostgreSQL already links systemd-minimal-libs; the services must add none.
-          if nix path-info -r .#pgbouncer .#postgrest .#pgweb .#s6 | grep systemd; then exit 1; fi
+          closure="$(nix path-info -r .#pgbouncer .#postgrest .#pgweb .#s6)"
+          if grep systemd <<< "$closure"; then exit 1; fi
       - name: Smoke test
         run: |
           docker load < image.tar.gz
           docker run -d --name smoke --cap-drop=ALL --security-opt=no-new-privileges \
-            -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=app -e PGWEB_ENABLED=1 \
+            -e POSTGRES_PASSWORD=smoke-only-at-least-32-characters -e POSTGRES_DB=app -e PGWEB_ENABLED=1 \
             -v "$PWD/tests/initdb:/docker-entrypoint-initdb.d:ro" "postgres-sunday-roast:$VERSION"
           tests/smoke.sh smoke docker
       - name: Service switches and PostgreSQL failure
@@ -60,13 +63,14 @@ jobs:
           listening defaults 6432
           listening defaults 3000
           if listening defaults 8081; then exit 1; fi
+          docker logs defaults 2>&1 | grep -F 'PostgREST JWT auth is off'
           # Killing the postmaster must end the whole tree, not restart postgres.
           docker exec defaults bash -c 'read -r pid < "$PGDATA/postmaster.pid"; kill -KILL "$pid"'
           timeout 15 docker wait defaults
           test "$(docker inspect defaults --format '{{.State.Running}}')" = false
           test "$(docker inspect defaults --format '{{.State.ExitCode}}')" != 0
           docker run -d --name disabled --read-only --cap-drop=ALL --security-opt=no-new-privileges \
-            --tmpfs /run/postgresql:mode=1777 --tmpfs /run/psr-services:mode=1777 --tmpfs /tmp \
+            --tmpfs /run/postgresql:mode=1777 --tmpfs /run/psr-services:exec,mode=1777 --tmpfs /tmp \
             -e POSTGRES_PASSWORD=smoke-only \
             -e PGBOUNCER_ENABLED=false -e POSTGREST_ENABLED=false "postgres-sunday-roast:$VERSION"
           wait_postgres disabled
@@ -75,6 +79,12 @@ jobs:
           done
           docker stop disabled
           test "$(docker inspect disabled --format '{{.State.ExitCode}}')" = 0
+          # Trust permits PostgreSQL without a password, but never pgweb.
+          docker run -d --name no-web-password -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -e PGWEB_ENABLED=1 "postgres-sunday-roast:$VERSION"
+          timeout 15 docker wait no-web-password
+          test "$(docker inspect no-web-password --format '{{.State.ExitCode}}')" != 0
+          docker logs no-web-password 2>&1 | grep -F 'set PGWEB_AUTH_PASS or POSTGRES_PASSWORD'
       - name: Commands
         run: |
           docker run --rm "postgres-sunday-roast:$VERSION" postgres --version
@@ -88,7 +98,7 @@ jobs:
       - name: Logs on failure
         if: failure()
         run: |
-          for container in smoke defaults disabled; do docker logs "$container" || true; done
+          for container in smoke defaults disabled no-web-password; do docker logs "$container" || true; done
       - name: Size
         run: |
           docker image inspect "postgres-sunday-roast:$VERSION" --format '{{.Size}}' |
