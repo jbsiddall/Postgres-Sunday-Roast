@@ -70,10 +70,31 @@ select cron.schedule_in_database('nightly-vacuum', '0 3 * * *', 'vacuum analyze'
 | `POSTGRES_SSL_CN` | `postgres` | Common name of the generated certificate. |
 | `POSTGRES_SHARED_PRELOAD_LIBRARIES` | `pg_stat_statements,pg_cron,pg_ivm,pg_duckdb` | Change what is preloaded. |
 | `POSTGRES_CRON_DATABASE` | `postgres` | Database that holds `pg_cron`'s tables. |
+| `PGBOUNCER_ENABLED` | `true` | Start the connection pooler. |
+| `PGBOUNCER_PORT` | `6432` | Pooler's TCP port; configurable independently of PostgreSQL. |
+| `PGBOUNCER_POOL_MODE` | `transaction` | Pool by `transaction`, `session` or `statement`. See Services. |
+| `PGBOUNCER_DEFAULT_POOL_SIZE` | `20` | Maximum server connections per database/user pair. |
+| `PGBOUNCER_MAX_CLIENT_CONN` | `100` | Maximum pooler client connections. |
+| `POSTGREST_ENABLED` | `true` | Start the HTTP database API. |
+| `PGRST_SERVER_PORT` | `3000` | PostgREST's HTTP port. |
+| `PGRST_DB_URI` | socket, `$POSTGRES_USER`, `$POSTGRES_DB` | PostgREST's libpq connection string. Use a restricted authenticator before enabling requests. |
+| `PGRST_DB_SCHEMAS` | `public` | Schemas exposed by PostgREST. |
+| `PGRST_DB_ANON_ROLE` | unset | Role for anonymous requests; none are accepted by default. |
+| `PGRST_JWT_SECRET` | unset | JWT verification secret (at least 32 characters) or JWK/JWKS. |
+| `PGRST_JWT_SECRET_FILE` | unset | Read the JWT secret from this file instead. |
+| `PGWEB_ENABLED` | `false` | Start the web SQL client. |
+| `PGWEB_PORT` | `8081` | pgweb's HTTP port, bound to `0.0.0.0`. |
+| `PGWEB_AUTH_USER` | unset | Optional HTTP basic-auth user; also set a password. |
+| `PGWEB_AUTH_PASS` | unset | HTTP basic-auth password, read from the environment, not process arguments; also set a user. |
+| `PGWEB_AUTH_PASS_FILE` | unset | Read the basic-auth password from this file instead. |
 
 `POSTGRES_PASSWORD`, `POSTGRES_USER`, `POSTGRES_DB` and `POSTGRES_INITDB_ARGS`
-can instead be read from a file, such as a Docker or Kubernetes secret, by
-setting `POSTGRES_PASSWORD_FILE` and so on. Setting both forms is an error.
+as well as `PGRST_JWT_SECRET` and `PGWEB_AUTH_PASS` can instead be read from a
+file, such as a Docker or Kubernetes secret, by setting `POSTGRES_PASSWORD_FILE`
+and so on. Setting both forms is an error.
+
+Service switches accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`
+(case insensitive); an empty value disables the service. Other values are errors.
 
 Settings: any arguments after the image name go to `postgres` and override the
 defaults, both during init scripts and afterwards. A leading `postgres` is
@@ -94,9 +115,10 @@ Init scripts: on first start, `*.sql`, `*.sql.gz` and `*.sh` files in
 a plain `psql` works too. During that step the server only listens on its Unix
 socket, so clients cannot connect to a half-built database.
 
-Stopping: the image's stop signal is `SIGINT`, so `docker stop` disconnects
-clients and shuts down cleanly instead of waiting for idle connections until
-the server is killed.
+Stopping: the image's stop signal is `SIGTERM`. s6 stops all services and sends
+PostgreSQL `SIGINT` for a fast shutdown, disconnecting busy clients cleanly.
+If PostgreSQL exits unexpectedly, the container exits too; s6 restarts the
+other services if they fail. Service output goes to the container log.
 
 Authentication: local socket connections are trusted, and every TCP connection
 must use a password (SCRAM-SHA-256, unless `POSTGRES_HOST_AUTH_METHOD` says
@@ -105,6 +127,84 @@ change `host` to `hostssl` in `pg_hba.conf`.
 
 User: the server runs as uid and gid 999. If a volume was created for a
 different uid, `chown -R 999:999` it first.
+
+## Services
+
+| Service | Container port | Default |
+| --- | --- | --- |
+| PostgreSQL | `5432` | On |
+| PgBouncer | `6432` (`PGBOUNCER_PORT`) | On |
+| PostgREST | `3000` (`PGRST_SERVER_PORT`) | On, requests refused until configured |
+| pgweb | `8081` (`PGWEB_PORT`) | Off |
+
+Publish only the ports you need with `-p`. For example, add `-p 6432:6432`
+and connect with the same database credentials through the pooler:
+
+```sh
+# Direct connection
+psql 'postgres://postgres:change-me@localhost:5432/postgres?sslmode=require'
+# Pooled connection
+psql 'postgres://postgres:change-me@localhost:6432/postgres?sslmode=require'
+psql 'postgres://postgres:change-me@localhost:6432/pgbouncer?sslmode=require' -c 'show pools'
+```
+
+PgBouncer maps any database name to the same database over `/run/postgresql`.
+It looks up login roles and password hashes in PostgreSQL, including password
+expiry, with no userlist to maintain. Its client authentication follows
+`POSTGRES_HOST_AUTH_METHOD` (`scram-sha-256`, `md5` or `trust`), and it accepts
+TLS and plain TCP with the same certificate as PostgreSQL. Keep local socket
+authentication trusted for these services. PgBouncer's admin and stats user is
+`POSTGRES_USER`; names with whitespace or commas require disabling PgBouncer
+because its user lists cannot represent them. Other host authentication methods
+also require `PGBOUNCER_ENABLED=false`. On an existing volume, keep the host
+authentication variable consistent with `pg_hba.conf`.
+
+Transaction pooling supports drivers' protocol-level named prepared statements
+(`max_prepared_statements=100`), but session `SET`, session advisory locks,
+`LISTEN` and SQL `PREPARE`/`EXECUTE` cannot be relied on across transactions.
+Use `PGBOUNCER_POOL_MODE=session` or connect directly for session state. The
+pool size is per database/user pair, so many pairs can exhaust PostgreSQL's
+connection limit.
+
+PostgREST reads all `PGRST_*` variables natively and retries database connections
+while PostgreSQL starts. No anonymous role or JWT secret is set by default, so
+requests are refused. Before enabling API access, create a restricted login
+role and grant it only the API roles it should assume. For example, run this
+in the application database (or put it in an init script):
+
+```sql
+create role authenticator login noinherit;
+create role api_anon nologin;
+grant api_anon to authenticator;
+grant usage on schema public to api_anon;
+-- Grant SELECT on specific tables or views that may be public:
+-- grant select on public.items to api_anon;
+```
+
+Then recreate the container with these environment variables:
+
+```sh
+PGRST_DB_URI='host=/run/postgresql port=5432 user=authenticator dbname=app'
+PGRST_DB_ANON_ROLE=api_anon
+PGRST_JWT_SECRET_FILE=/run/secrets/postgrest-jwt
+```
+
+The secret file must hold a random secret of at least 32 characters (or a
+JWK/JWKS). Grant additional API roles to `authenticator` as needed. Leaving
+`PGRST_DB_URI` as the default superuser means any valid JWT can switch to any
+role, including superusers. Change the URI before setting a JWT secret or an
+anonymous role. See the [PostgREST role model](https://docs.postgrest.org/en/v14/references/auth.html).
+
+Enable pgweb with `PGWEB_ENABLED=1` and publish port 8081. It starts in sessions
+mode with no preconfigured database; enter a database URL in the browser. Set
+both `PGWEB_AUTH_USER` and `PGWEB_AUTH_PASS` (or `PGWEB_AUTH_PASS_FILE`) for
+basic authentication, and use a TLS reverse proxy for remote access. pgweb can
+connect to any host the container can reach, including databases on trusted
+local sockets. Do not expose it publicly.
+
+Enabled services start together under `s6-svscan` as PID 1, with no root,
+capabilities or systemd. Services do not start lazily on the first connection;
+the tradeoff is recorded in [IMPLEMENTATION_DECISIONS.md](IMPLEMENTATION_DECISIONS.md).
 
 ### Docker Compose
 
@@ -126,7 +226,10 @@ volumes:
 ### Kubernetes
 
 Set `securityContext.runAsUser`, `runAsGroup` and `fsGroup` to 999 and mount
-the volume at `/var/lib/postgresql`.
+the volume at `/var/lib/postgresql`. `runAsNonRoot: true` is supported. With
+`readOnlyRootFilesystem: true`, also mount writable `emptyDir` volumes at
+`/run/postgresql`, `/run/psr-services` (s6 state and generated configuration)
+and `/tmp`, owned by uid 999 or writable through `fsGroup: 999`.
 
 PostgreSQL refuses a private key that others can read. To use a certificate
 from a TLS Secret, mount it with `defaultMode: 0440`. The files are then owned
@@ -162,11 +265,12 @@ Images are built for `linux/amd64`.
 
 ## Size
 
-The image is 714 MB uncompressed, which is 230 MB to download. The official
-`postgres:18` image is 464 MB and includes none of these extensions. Nix
-copies only runtime files into the image, so compilers and build
-dependencies never end up in it. The biggest parts are Python (137 MB, for
-PL/Python), DuckDB (69 MB), GDAL and PROJ (for PostGIS) and ICU.
+<!-- size: filled in after the host run -->
+
+Nix copies only runtime files into the image, so compilers and build
+dependencies never end up in it. PgBouncer is built without systemd and
+PostgREST uses its binary output to keep the runtime closure small. The biggest
+parts are Python (for PL/Python), DuckDB, GDAL and PROJ (for PostGIS) and ICU.
 
 ## Upgrading from the official image
 
@@ -201,9 +305,11 @@ docker run -d --name smoke -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=app \
 tests/smoke.sh smoke docker
 ```
 
-The smoke test checks SSL, the preloaded libraries, the init scripts and
-`pg_cron`, then creates every available extension. CI runs the same test on
-every pull request and pushes the image to GHCR from `main`.
+The smoke test checks SSL, PgBouncer authentication and TLS, PostgREST's refusal
+of anonymous requests, pgweb when enabled, the preloaded libraries, init scripts
+and `pg_cron`, then creates every available extension. CI also checks service
+switches and shutdown, runs on every pull request and pushes the image to GHCR
+from `main`.
 
 ## Not included
 

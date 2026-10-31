@@ -4,6 +4,8 @@
 # extension can be created. Start the container with POSTGRES_DB=app and
 # tests/initdb mounted at /docker-entrypoint-initdb.d.
 #   tests/smoke.sh <container> [docker|podman]
+# Variables in bash -c scripts expand inside the container.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 container="$1"
@@ -22,6 +24,66 @@ check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: got '$2',
 
 check ssl "$(psql -c 'show ssl')" on
 check ssl-over-tcp "$("$engine" exec "$container" bash -c 'PGPASSWORD=$POSTGRES_PASSWORD psql "host=127.0.0.1 sslmode=require user=postgres dbname=postgres" -XAtc "select ssl from pg_stat_ssl where pid = pg_backend_pid()"')" t
+
+# PgBouncer can listen before PostgreSQL is ready for its auth_query.
+for _ in $(seq 60); do
+  if "$engine" exec "$container" bash -c 'PGPASSWORD=$POSTGRES_PASSWORD psql "host=127.0.0.1 port=${PGBOUNCER_PORT:-6432} user=postgres dbname=postgres connect_timeout=2" -XAtc "select 1"' > /dev/null 2>&1; then break; fi
+  sleep 1
+done
+pool_psql() {
+  "$engine" exec "$container" bash -c 'export PGPASSWORD=$POSTGRES_PASSWORD; exec psql "host=127.0.0.1 port=${PGBOUNCER_PORT:-6432} user=postgres dbname=$1 sslmode=$2 connect_timeout=5" -XAt -v ON_ERROR_STOP=1 -c "$3"' bash "$@"
+}
+check pgbouncer-tcp "$(pool_psql app disable 'select current_database()')" app
+# pg_stat_ssl describes the socket backend, so require TLS on the client hop.
+check pgbouncer-ssl "$(pool_psql postgres require 'select 42')" 42
+pools="$(pool_psql pgbouncer require 'show pools')"
+check pgbouncer-admin "$(grep -c '^postgres|postgres|' <<< "$pools")" 1
+if "$engine" exec "$container" bash -c 'PGPASSWORD=deliberately-wrong psql "host=127.0.0.1 port=${PGBOUNCER_PORT:-6432} user=postgres dbname=postgres connect_timeout=5" -XAtc "select 1"' > /dev/null 2>&1; then
+  check pgbouncer-rejects-password accepted rejected
+else
+  check pgbouncer-rejects-password rejected rejected
+fi
+# A role created after startup must work without a generated userlist.
+psql -c "create role smoke_pool login password 'pool-only'"
+check pgbouncer-role "$("$engine" exec "$container" bash -c 'PGPASSWORD=pool-only psql "host=127.0.0.1 port=${PGBOUNCER_PORT:-6432} user=smoke_pool dbname=app sslmode=require connect_timeout=5" -XAtc "select current_user"')" smoke_pool
+psql -c 'drop role smoke_pool'
+
+http_status() {
+  "$engine" exec "$container" bash -c '
+    exec 3<>/dev/tcp/127.0.0.1/"$1"
+    printf "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3
+    read -r -t 5 status <&3
+    printf "%s\n" "$status"
+  ' bash "$1" 2> /dev/null
+}
+pgrst_port="$("$engine" exec "$container" bash -c 'printf "%s" "${PGRST_SERVER_PORT:-3000}"')"
+status=
+for _ in $(seq 60); do
+  status="$(http_status "$pgrst_port" || true)"
+  case "$status" in *' 401 '* | *' 403 '*) break ;; esac
+  sleep 1
+done
+case "$status" in
+  *' 401 '* | *' 403 '*) check postgrest-anonymous refused refused ;;
+  *) check postgrest-anonymous "$status" 'HTTP 401 or 403' ;;
+esac
+pgweb_enabled="$("$engine" exec "$container" bash -c 'printf "%s" "${PGWEB_ENABLED:-false}"')"
+case "${pgweb_enabled,,}" in
+  1 | true | yes | on)
+    pgweb_port="$("$engine" exec "$container" bash -c 'printf "%s" "${PGWEB_PORT:-8081}"')"
+    status=
+    for _ in $(seq 30); do
+      status="$(http_status "$pgweb_port" || true)"
+      case "$status" in *' 200 '* | *' 401 '*) break ;; esac
+      sleep 1
+    done
+    case "$status" in
+      *' 200 '* | *' 401 '*) check pgweb-http answered answered ;;
+      *) check pgweb-http "$status" 'HTTP 200 or 401' ;;
+    esac
+    ;;
+esac
+
 check preload "$(psql -c 'show shared_preload_libraries')" pg_stat_statements,pg_cron,pg_ivm,pg_duckdb
 check collate "$(psql -c "select datcollate from pg_database where datname = 'postgres'")" en_US.UTF-8
 check initdb-sql "$(psql -d app -c 'select count(*) from items')" 2

@@ -34,7 +34,7 @@ file_env() {
     unset "$file_var"
   fi
 }
-for name in POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB POSTGRES_INITDB_ARGS; do
+for name in POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB POSTGRES_INITDB_ARGS PGRST_JWT_SECRET PGWEB_AUTH_PASS; do
   file_env "$name"
 done
 export POSTGRES_USER="${POSTGRES_USER:-postgres}"
@@ -143,4 +143,147 @@ if [ -n "$fresh" ]; then
   if [ -n "$set_pgpassword" ]; then unset PGPASSWORD; fi
 fi
 
-exec postgres -D "$PGDATA" "${settings[@]}" -c listen_addresses='*' "$@"
+# Keep the final server's arguments intact, including overrides from the caller.
+server=(postgres -D "$PGDATA" "${settings[@]}" -c listen_addresses='*' "$@")
+pg_port="$("${server[@]}" -C port)"
+cert="$("${server[@]}" -C ssl_cert_file)"
+key="$("${server[@]}" -C ssl_key_file)"
+# PostgreSQL resolves relative certificate paths against PGDATA.
+[[ "$cert" = /* ]] || cert="$PGDATA/$cert"
+[[ "$key" = /* ]] || key="$PGDATA/$key"
+
+enabled() {
+  case "${1,,}" in
+    1 | true | yes | on) return 0 ;;
+    0 | false | no | off | '') return 1 ;;
+    *) echo "Invalid service switch: $1 (use true or false)" >&2; exit 1 ;;
+  esac
+}
+
+# This directory is separate from PGDATA so an emptyDir can hold all s6 state.
+runtime=/run/psr-services
+services="$runtime/services"
+mkdir -p "$runtime"
+rm -rf "$services"
+mkdir -p "$services/.s6-svscan"
+service() {
+  local name="$1"
+  shift
+  mkdir -p "$services/$name"
+  {
+    printf '#!/bin/bash\nexec '
+    printf '%q ' "$@"
+    printf '\n'
+  } > "$services/$name/run"
+  chmod 700 "$services/$name/run"
+}
+
+service postgres "${server[@]}"
+echo INT > "$services/postgres/down-signal"
+cat > "$services/postgres/finish" <<'EOF'
+#!/bin/bash
+# Exit 125 prevents even a brief restart while svscan takes the tree down.
+if [ ! -e ../.s6-svscan/stopping ]; then
+  status="$1"
+  if [ "$status" -eq 256 ]; then status=$((128 + $2)); fi
+  if [ "$status" -eq 0 ]; then status=1; fi
+  echo "$status" > ../.s6-svscan/exitcode
+  s6-svscanctl -t ..
+fi
+exit 125
+EOF
+cat > "$services/.s6-svscan/SIGTERM" <<'EOF'
+#!/bin/bash
+# Mark an intentional stop before postgres's finish script runs.
+touch .s6-svscan/stopping
+exec s6-svscanctl -t .
+EOF
+ln -s SIGTERM "$services/.s6-svscan/SIGINT"
+cat > "$services/.s6-svscan/finish" <<'EOF'
+#!/bin/bash
+status=0
+if [ -f .s6-svscan/exitcode ]; then read -r status < .s6-svscan/exitcode; fi
+exit "$status"
+EOF
+chmod 700 "$services/postgres/finish" "$services/.s6-svscan/SIGTERM" "$services/.s6-svscan/finish"
+
+if enabled "${PGBOUNCER_ENABLED-true}"; then
+  case "$auth" in
+    scram-sha-256 | md5 | trust) ;;
+    *) echo "PgBouncer supports POSTGRES_HOST_AUTH_METHOD=scram-sha-256, md5 or trust; disable it for other methods" >&2; exit 1 ;;
+  esac
+  # PgBouncer's user lists cannot represent names containing commas or spaces.
+  if [[ "$POSTGRES_USER" = *[[:space:],]* ]]; then
+    echo "PgBouncer requires POSTGRES_USER without whitespace or commas; set PGBOUNCER_ENABLED=false for this role name" >&2
+    exit 1
+  fi
+  # INI values are literal lines, with leading/trailing whitespace stripped.
+  for value in "$cert" "$key"; do
+    if [[ "$value" = *$'\n'* || "$value" = *$'\r'* || "$value" = [[:space:]]* || "$value" = *[[:space:]] ]]; then
+      echo "PgBouncer certificate paths cannot contain newlines or surrounding whitespace" >&2
+      exit 1
+    fi
+  done
+  for name in PGBOUNCER_PORT PGBOUNCER_DEFAULT_POOL_SIZE PGBOUNCER_MAX_CLIENT_CONN; do
+    value="${!name:-}"
+    if [[ -n "$value" && ( ! "$value" =~ ^[0-9]+$ || "$value" =~ ^0+$ ) ]]; then
+      echo "$name must be a positive integer" >&2
+      exit 1
+    fi
+  done
+  pool_mode="${PGBOUNCER_POOL_MODE:-transaction}"
+  case "$pool_mode" in
+    transaction | session | statement) ;;
+    *) echo "PGBOUNCER_POOL_MODE must be transaction, session or statement" >&2; exit 1 ;;
+  esac
+  cat > "$runtime/pgbouncer.ini" <<EOF
+[databases]
+* = host=/run/postgresql port=$pg_port
+
+[pgbouncer]
+listen_addr = *
+listen_port = ${PGBOUNCER_PORT:-6432}
+unix_socket_dir =
+auth_type = $auth
+auth_user = $POSTGRES_USER
+auth_dbname = postgres
+auth_query = SELECT rolname, CASE WHEN rolvaliduntil < now() THEN NULL ELSE rolpassword END FROM pg_authid WHERE rolname=\$1 AND rolcanlogin
+pool_mode = $pool_mode
+max_prepared_statements = 100
+default_pool_size = ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+max_client_conn = ${PGBOUNCER_MAX_CLIENT_CONN:-100}
+client_tls_sslmode = allow
+client_tls_cert_file = $cert
+client_tls_key_file = $key
+admin_users = $POSTGRES_USER
+stats_users = $POSTGRES_USER
+EOF
+  chmod 600 "$runtime/pgbouncer.ini"
+  service pgbouncer pgbouncer "$runtime/pgbouncer.ini"
+  # Since 1.23, PgBouncer's TERM waits for clients, including idle consoles.
+  echo QUIT > "$services/pgbouncer/down-signal"
+fi
+
+# libpq keyword values escape quotes and backslashes, unlike shell arguments.
+conn_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\'/\\\'}"
+  printf "'%s'" "$value"
+}
+if enabled "${POSTGREST_ENABLED-true}"; then
+  PGRST_DB_URI="${PGRST_DB_URI-host=/run/postgresql port=$pg_port user=$(conn_value "$POSTGRES_USER") dbname=$(conn_value "$POSTGRES_DB")}"
+  export PGRST_DB_URI
+  export PGRST_DB_SCHEMAS="${PGRST_DB_SCHEMAS-public}"
+  export PGRST_SERVER_PORT="${PGRST_SERVER_PORT-3000}"
+  service postgrest postgrest
+fi
+
+if enabled "${PGWEB_ENABLED-false}"; then
+  # pgweb reads basic-auth credentials from the environment, not argv.
+  service pgweb env -u PGWEB_LOCK_SESSION -u LOCK_SESSION pgweb \
+    --bind=0.0.0.0 --listen="${PGWEB_PORT:-8081}" --sessions --skip-open \
+    --bookmarks-dir="$runtime/bookmarks" --queries-dir="$runtime/queries"
+fi
+
+exec s6-svscan "$services"
